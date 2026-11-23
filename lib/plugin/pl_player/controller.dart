@@ -413,63 +413,99 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   // again, so that is done once the transition has settled.
   Timer? _hwdecTimer;
 
-  /// Whether hardware decoding has been in use for the current media. Media
-  /// that cannot be decoded in hardware is left alone.
-  bool _hwdecSeen = false;
+  /// Identifies the media the hwdec state below belongs to. Bumped whenever
+  /// other media is opened or the player is disposed, so that observations
+  /// and timers of the previous media are ignored.
+  int _hwdecGeneration = 0;
 
-  /// Whether the current media was opened in background, where it may never
-  /// have got a hardware decoder. Allows a single attempt.
-  bool _hwdecRetryOnce = false;
+  /// Whether the media of [_hwdecGeneration] has been handed to mpv.
+  bool _hwdecOpened = false;
 
+  /// Allows a single attempt to restore hardware decoding. Granted when it has
+  /// been seen working for the current media, or when the media was opened in
+  /// background, where it may never have got a hardware decoder. Consumed
+  /// before the attempt, so a decoder that fails again is left alone until
+  /// hardware decoding is seen working again: media that cannot be decoded in
+  /// hardware is not reloaded on every transition.
+  bool _hwdecArmed = false;
+
+  /// `hwdec-current` of the current media, `null` while unknown: before the
+  /// media is opened, while mpv still plays or tears down the previous media,
+  /// before the decoder is created and without a video track.
   String? get _hwdecCurrent {
+    if (!_hwdecOpened) return null;
+    final player = _videoPlayerController;
+    if (player == null) return null;
     try {
-      // Empty without a video track.
-      return _videoPlayerController?.getProperty('hwdec-current');
+      // Opening media clears the playlist, so this is -1 until mpv plays an
+      // entry of the current media.
+      final pos = int.tryParse(player.getProperty('playlist-playing-pos'));
+      if (pos == null || pos < 0) return null;
+      final current = player.getProperty('hwdec-current');
+      return current.isEmpty ? null : current;
     } catch (_) {
       // Disposed.
       return null;
     }
   }
 
-  void _resetHwdecState() {
+  /// Forgets the hwdec state of the current media.
+  void _invalidateHwdec() {
+    _hwdecGeneration++;
     _hwdecTimer?.cancel();
     _hwdecTimer = null;
-    _hwdecSeen = false;
-    _hwdecRetryOnce = Platform.isIOS && !IOSPipHelper.isResumed;
+    _hwdecOpened = false;
+    _hwdecArmed = false;
   }
+
+  /// Opens media through [open] with a fresh hwdec state.
+  Future<void> _openWithHwdecState(Future<void> Function() open) async {
+    _invalidateHwdec();
+    final generation = _hwdecGeneration;
+    _hwdecArmed = Platform.isIOS && !IOSPipHelper.isResumed;
+    await open();
+    if (generation == _hwdecGeneration) _hwdecOpened = true;
+  }
+
+  bool get _hwdecEnabled => Platform.isIOS && hwdec != null && hwdec != 'no';
 
   /// Remembers whether hardware decoding is in use.
   void noteHwdec() {
-    if (!Platform.isIOS || hwdec == null || hwdec == 'no') return;
+    if (!_hwdecEnabled) return;
     final current = _hwdecCurrent;
-    if (current != null && current.isNotEmpty && current != 'no') {
-      _hwdecSeen = true;
+    if (current != null && current != 'no') {
+      _hwdecArmed = true;
     }
   }
 
   /// Checks shortly after entering or leaving PiP or the background whether
-  /// hardware decoding was lost, and restores it. A transition makes at most
-  /// one attempt: calls in quick succession are merged.
+  /// hardware decoding was lost, and restores it. Calls in quick succession
+  /// are merged into one check.
   void scheduleHwdecCheck() {
-    if (!Platform.isIOS || hwdec == null || hwdec == 'no') return;
+    if (!_hwdecEnabled) return;
     noteHwdec();
     _hwdecTimer?.cancel();
-    _hwdecTimer = Timer(const Duration(seconds: 1), _checkHwdec);
+    final generation = _hwdecGeneration;
+    _hwdecTimer = Timer(
+      const Duration(seconds: 1),
+      () => _checkHwdec(generation),
+    );
   }
 
-  void _checkHwdec() {
+  void _checkHwdec(int generation) {
+    if (generation != _hwdecGeneration) return;
     _hwdecTimer = null;
     final player = _videoPlayerController;
     final configured = hwdec;
     if (player == null || configured == null || configured == 'no') return;
     final current = _hwdecCurrent;
-    if (current == null || current.isEmpty) return;
+    if (current == null) return;
     if (current != 'no') {
-      _hwdecSeen = true;
+      _hwdecArmed = true;
       return;
     }
-    if (!_hwdecSeen && !_hwdecRetryOnce) return;
-    _hwdecRetryOnce = false;
+    if (!_hwdecArmed) return;
+    _hwdecArmed = false;
     try {
       // As set by media_kit, which may differ from the setting.
       final value = player.getProperty('hwdec');
@@ -838,6 +874,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
       if (_playerCount == 0) {
         _removeListeners();
+        _invalidateHwdec();
         _videoPlayerController?.dispose();
         _videoPlayerController = null;
         _videoController = null;
@@ -1025,14 +1062,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     assert(!isLive || seekTo == null);
-    _resetHwdecState();
-    await player.open(
-      Media(
-        video,
-        start: seekTo,
-        extras: extras.isEmpty ? null : extras,
+    final opening = player;
+    await _openWithHwdecState(
+      () => opening.open(
+        Media(
+          video,
+          start: seekTo,
+          extras: extras.isEmpty ? null : extras,
+        ),
+        play: false,
       ),
-      play: false,
     );
   }
 
@@ -1043,7 +1082,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
-      return ctr.open(media, play: true);
+      return _openWithHwdecState(() => ctr.open(media, play: true));
     }
     return null;
   }
@@ -1766,8 +1805,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     _removeListeners();
-    _hwdecTimer?.cancel();
-    _hwdecTimer = null;
+    _invalidateHwdec();
     _positionListeners.clear();
     _statusListeners.clear();
     _stopWakeLockTimer();
