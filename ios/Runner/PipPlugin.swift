@@ -1,6 +1,7 @@
 import AVKit
 import CoreImage
 import Flutter
+import os
 import UIKit
 
 /// Picture-in-Picture for the video texture rendered by media_kit (mpv).
@@ -333,7 +334,7 @@ private final class PipSession: NSObject {
     // mpv renders into the source buffer again about a frame after it stops
     // being the current one, so `submit` copies it (and downscales it if
     // needed) before returning, the layer only ever gets the copy.
-    pipeline.submit(source) { [weak self] enqueued in
+    pipeline.submit(source, isPipActive: isActive) { [weak self] enqueued in
       guard let self else { return }
       self.frameInFlight = false
       guard !self.invalidated, enqueued, !self.hasFrame else { return }
@@ -366,6 +367,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     isActive = true
     stopRequested = false
     restoring = false
+    pipeline.resetDiagnostics()
     frameAvailable(force: true)
     sendEvent("onStateChanged", ["active": true])
   }
@@ -444,13 +446,8 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     _ pictureInPictureController: AVPictureInPictureController,
     didTransitionToRenderSize newRenderSize: CMVideoDimensions
   ) {
-    // Reported in points.
-    let scale = max(sourceView.traitCollection.displayScale, 1)
-    let size = CGSize(
-      width: Double(newRenderSize.width) * scale,
-      height: Double(newRenderSize.height) * scale
-    )
-    pipeline.setRenderSize(size) { [weak self] in
+    // AVKit reports pixel dimensions. The source view's layout is in points.
+    pipeline.setRenderSize(newRenderSize) { [weak self] in
       self?.frameAvailable(force: true)
     }
   }
@@ -510,6 +507,8 @@ private final class FramePipeline {
   private static let maxBufferCount = 6
   /// Number of consecutive dropped frames after which the layer is flushed again.
   private static let flushAfterDrops = 30
+  private static let log = Logger(subsystem: "com.example.piliplus", category: "PiP")
+  private static let diagnosticsInterval: CFTimeInterval = 5
 
   private let queue = DispatchQueue(label: "com.example.piliplus.pip.frame")
   private let timebase: CMTimebase
@@ -526,10 +525,14 @@ private final class FramePipeline {
   private var poolSize = CGSize.zero
   private var formatDescription: CMVideoFormatDescription?
   /// Size of the PiP window in pixels, zero until known.
-  private var renderSize = CGSize.zero
+  private var renderSizePixels = CGSize.zero
   private var consecutiveDrops = 0
   private var lastPresentationTime = CMTime.invalid
   private var lastLogTime: CFTimeInterval = 0
+  private var lastDiagnosticsTime: CFTimeInterval = 0
+  private var snapshotDuration: CFTimeInterval = 0
+  private var submittedFrames = 0
+  private var droppedFrames = 0
   /// Set when the pool was replaced, frames of the previous size still hold
   /// its buffers until the layer is flushed.
   private var flushBeforeEnqueue = false
@@ -541,21 +544,40 @@ private final class FramePipeline {
 
   /// Copies `source` before returning, `source` is not accessed afterwards.
   /// Then enqueues the copy, `completion` tells whether it was.
-  func submit(_ source: CVPixelBuffer, completion: @escaping (Bool) -> Void) {
+  func submit(
+    _ source: CVPixelBuffer,
+    isPipActive: Bool,
+    completion: @escaping (Bool) -> Void
+  ) {
     dispatchPrecondition(condition: .notOnQueue(queue))
     // Temporary objects keep buffers of the pool alive until they are released.
-    let snapshot = queue.sync { autoreleasepool { self.snapshot(source) } }
+    let (snapshot, duration) = queue.sync {
+      let start = isPipActive ? CACurrentMediaTime() : 0
+      let snapshot = autoreleasepool { self.snapshot(source) }
+      return (snapshot, isPipActive ? CACurrentMediaTime() - start : 0)
+    }
     queue.async {
       let enqueued = autoreleasepool { self.deliver(snapshot) }
+      if isPipActive {
+        self.recordSnapshot(duration: duration, enqueued: enqueued)
+      }
       DispatchQueue.main.async { completion(enqueued) }
     }
   }
 
-  func setRenderSize(_ size: CGSize, completion: @escaping () -> Void) {
+  func setRenderSize(_ dimensions: CMVideoDimensions, completion: @escaping () -> Void) {
+    let size = CGSize(width: Int(dimensions.width), height: Int(dimensions.height))
     queue.async {
-      self.renderSize = size
+      if self.renderSizePixels != size {
+        self.renderSizePixels = size
+        Self.log.notice("AVKit render size: \(dimensions.width)x\(dimensions.height) px")
+      }
       DispatchQueue.main.async(execute: completion)
     }
+  }
+
+  func resetDiagnostics() {
+    queue.async { self.resetDiagnostics(at: CACurrentMediaTime()) }
   }
 
   /// Discards the frames queued in the layer, the displayed one is kept.
@@ -580,6 +602,29 @@ private final class FramePipeline {
   }
 
   // MARK: On `queue`
+
+  private func resetDiagnostics(at time: CFTimeInterval) {
+    lastDiagnosticsTime = time
+    snapshotDuration = 0
+    submittedFrames = 0
+    droppedFrames = 0
+  }
+
+  private func recordSnapshot(duration: CFTimeInterval, enqueued: Bool) {
+    snapshotDuration += duration
+    submittedFrames += 1
+    if !enqueued { droppedFrames += 1 }
+    let now = CACurrentMediaTime()
+    guard now - lastDiagnosticsTime >= Self.diagnosticsInterval else { return }
+
+    let averageMs = snapshotDuration * 1000 / Double(submittedFrames)
+    let width = Int(poolSize.width)
+    let height = Int(poolSize.height)
+    Self.log.notice(
+      "Pool size: \(width)x\(height) px, average snapshot: \(averageMs, format: .fixed(precision: 2)) ms, dropped: \(self.droppedFrames)/\(self.submittedFrames) submitted frames"
+    )
+    resetDiagnostics(at: now)
+  }
 
   /// Copies `source` unless the frame would be dropped anyway. Only reads the
   /// state of the layer.
@@ -687,14 +732,14 @@ private final class FramePipeline {
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
     let sourceHeight = Double(CVPixelBufferGetHeight(source))
     guard sourceWidth > 0, sourceHeight > 0 else { return .failed }
-    let hasRenderSize = renderSize.width > 0 && renderSize.height > 0
+    let hasRenderSize = renderSizePixels.width > 0 && renderSizePixels.height > 0
     let maxDimension = hasRenderSize ? Self.maxDimension : Self.idleMaxDimension
     var scale = min(1, maxDimension / max(sourceWidth, sourceHeight))
     if hasRenderSize {
       // No need for more pixels than the PiP window has.
       scale = min(
         scale,
-        max(renderSize.width / sourceWidth, renderSize.height / sourceHeight)
+        max(renderSizePixels.width / sourceWidth, renderSizePixels.height / sourceHeight)
       )
     }
     let size = CGSize(
