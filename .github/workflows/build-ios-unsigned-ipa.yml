@@ -6,8 +6,20 @@
 #   `flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub`.
 # Adds: Payload packaging, IPA content + Mach-O + libmpv/FFmpeg (AV1/VideoToolbox) checks, SHA-256, artifact upload.
 #
-# Note: GitHub only lists workflow_dispatch workflows that exist on the default branch, so on this fork
-# the `push` trigger on the fix branch is what starts a build (or dispatch after this file reaches main).
+# Runs when app files are pushed to the fix branch, on manual dispatch, and when sync-upstream.yml
+# has merged a new upstream release (workflow_call: a push made with GITHUB_TOKEN starts no workflow).
+# Pushes that only touch .github/ or Markdown do not start a build; dispatch one by hand if needed.
+#
+# A strict build that passes every check is published as a GitHub release (push builds and sync builds
+# always, manual runs when asked). Each built commit gets its own tag,
+# `<app version>-pip.<build number>-<commit>`, with the IPA as the only asset, so a sideloader that
+# follows this repository's latest release installs it. A published release is never replaced.
+#
+# Four jobs, so that nothing the build job says about its own output is taken on trust:
+#   resolve  works out the commit, version, tag and IPA file name once, without running project code
+#   build    runs upstream code with a read-only token and uploads the IPA
+#   verify   checks that exact IPA on a fresh runner that has run none of that code
+#   publish  the only job that may write; publishes the IPA whose digest the verify job reported
 
 name: Build iOS unsigned IPA (sideload)
 
@@ -19,17 +31,41 @@ on:
         required: false
         default: true
         type: boolean
+      publish_release:
+        description: "Publish the IPA as a GitHub release (strict builds only)"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to build (default: the commit the calling workflow runs on)"
+        required: false
+        default: ""
+        type: string
+      strict_av1_check:
+        description: "Fail if av1_videotoolbox / libdav1d / Avcodec ABI checks fail"
+        required: false
+        default: true
+        type: boolean
+      publish_release:
+        description: "Publish the IPA as a GitHub release (strict builds only)"
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - fix/ios-pip-hwdec-av1
     paths-ignore:
       - "**.md"
+      - ".github/**"
 
 permissions:
   contents: read
 
+# publishing and artifact-only runs do not cancel each other
 concurrency:
-  group: ios-unsigned-ipa-${{ github.ref }}
+  group: ios-unsigned-ipa-${{ github.ref }}-${{ (github.event_name == 'push' || (inputs.publish_release && inputs.strict_av1_check)) && 'publish' || 'artifact' }}
   cancel-in-progress: true
 
 env:
@@ -40,14 +76,54 @@ env:
   EXPECTED_AVCODEC_MAJOR: "62"
 
 jobs:
+  resolve:
+    name: Resolve commit, version and names
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      app_version: ${{ steps.meta.outputs.app_version }}
+      build_number: ${{ steps.meta.outputs.build_number }}
+      tag: ${{ steps.meta.outputs.tag }}
+      ipa: ${{ steps.meta.outputs.ipa }}
+    steps:
+      # read only: nothing from the checkout is executed. `ref` is resolved here once, so every
+      # later job works on the same commit even if a branch moves meanwhile.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # empty outside workflow_call: the commit that triggered the run
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Work out version, tag and file name
+        id: meta
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          # same rule as lib/scripts/build.ps1: version name from pubspec.yaml, build number = commit count
+          app_version="$(sed -n -E 's/^[[:space:]]*version:[[:space:]]*([0-9]+(\.[0-9]+){1,3}).*/\1/p' pubspec.yaml | head -n 1)"
+          [ -n "$app_version" ] || { echo "::error::no version in pubspec.yaml"; exit 1; }
+          build_number="$(git rev-list --count HEAD)"
+          {
+            echo "sha=${sha}"
+            echo "app_version=${app_version}"
+            echo "build_number=${build_number}"
+            echo "tag=${app_version}-pip.${build_number}-${sha:0:9}"
+            echo "ipa=PiliPlus-${app_version}-b${build_number}-${IPA_SUFFIX}.ipa"
+          } | tee -a "$GITHUB_OUTPUT"
+
   build-ios-unsigned-ipa:
     name: Build unsigned iOS IPA
+    needs: resolve
     runs-on: macos-26
     timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.resolve.outputs.sha }}
           # build.ps1 uses `git rev-list --count HEAD` as the build number
           fetch-depth: 0
 
@@ -114,6 +190,8 @@ jobs:
 
       - name: Package unsigned IPA
         id: package
+        env:
+          EXPECTED_IPA: ${{ needs.resolve.outputs.ipa }}
         run: |
           set -euo pipefail
           # exported to $GITHUB_ENV by lib/scripts/build.ps1 ("<name>+<commit count>")
@@ -121,6 +199,8 @@ jobs:
           : "${version:?version not exported by lib/scripts/build.ps1}"
           safe_version="${version//+/-b}"
           ipa="PiliPlus-${safe_version}-${IPA_SUFFIX}.ipa"
+          # the later jobs look for the name the resolve job worked out
+          [ "$ipa" = "$EXPECTED_IPA" ] || { echo "::error::build.ps1 version gives ${ipa}, the resolve job expected ${EXPECTED_IPA}"; exit 1; }
           rm -rf Payload "$ipa"
           mkdir Payload
           ditto build/ios/iphoneos/Runner.app Payload/Runner.app
@@ -140,17 +220,45 @@ jobs:
           done < <(find Payload/Runner.app/Frameworks -depth -type d -name '*.framework' -print0)
           echo "signed and verified $signed framework(s)"
           zip -qr9y "$ipa" Payload
-          shasum -a 256 "$ipa" | tee "$ipa.sha256"
+          shasum -a 256 "$ipa"
           ls -lh "$ipa"
           echo "ipa=$ipa" >> "$GITHUB_OUTPUT"
 
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: PiliPlus-ios-unsigned-ipa
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-ipa:
+    name: Verify IPA on a clean runner
+    needs: [resolve, build-ios-unsigned-ipa]
+    runs-on: macos-26
+    timeout-minutes: 15
+    # no repository access: this job only reads the IPA (it is unpacked and inspected, never run)
+    permissions: {}
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+    steps:
+      - name: Download unsigned IPA
+        uses: actions/download-artifact@v8
+        with:
+          # uploaded with `archive: false`: the artifact is the file itself, named after it
+          name: ${{ needs.resolve.outputs.ipa }}
+
       - name: Verify IPA contents and Mach-O / FFmpeg
+        id: verify
         env:
-          IPA: ${{ steps.package.outputs.ipa }}
+          IPA: ${{ needs.resolve.outputs.ipa }}
           # push builds have no inputs: always strict
-          STRICT_AV1: ${{ github.event_name != 'workflow_dispatch' || inputs.strict_av1_check }}
+          STRICT_AV1: ${{ github.event_name == 'push' || inputs.strict_av1_check }}
         run: |
           set -euo pipefail
+          test -s "$IPA" || { echo "::error::IPA artifact ${IPA} is missing"; exit 1; }
+          shasum -a 256 "$IPA" | tee "$IPA.sha256"
           check_dir="$RUNNER_TEMP/ipa-check"
           rm -rf "$check_dir" && mkdir -p "$check_dir"
           unzip -q "$IPA" -d "$check_dir"
@@ -312,19 +420,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           cp "$report" "${IPA%.ipa}.verify.txt"
-          exit "$fail"
-
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v7
-        with:
-          archive: false
-          name: PiliPlus-ios-unsigned-ipa
-          path: ${{ steps.package.outputs.ipa }}
-          if-no-files-found: error
-          retention-days: 14
+          [ "$fail" -eq 0 ] || exit "$fail"
+          # only an IPA that passed is handed to the publish job, by digest
+          echo "digest=$(cut -d' ' -f1 "$IPA.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Upload verification report
-        if: always() && steps.package.outputs.ipa != ''
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: PiliPlus-ios-unsigned-ipa-report
@@ -333,3 +434,122 @@ jobs:
             PiliPlus-*-unsigned.verify.txt
           if-no-files-found: warn
           retention-days: 14
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [resolve, verify-ipa]
+    # push builds are always strict; other runs publish only when asked and strict
+    # (a workflow that calls this one from its own push trigger publishes too)
+    if: github.event_name == 'push' || (inputs.publish_release && inputs.strict_av1_check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download unsigned IPA
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.resolve.outputs.ipa }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          APP_VERSION: ${{ needs.resolve.outputs.app_version }}
+          BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          IPA: ${{ needs.resolve.outputs.ipa }}
+          VERIFIED_DIGEST: ${{ needs.verify-ipa.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test -s "$IPA" || { echo "::error::IPA artifact ${IPA} is missing"; exit 1; }
+          digest="$(sha256sum "$IPA" | cut -d' ' -f1)"
+          [[ "$VERIFIED_DIGEST" =~ ^[0-9a-f]{64}$ ]] && [ "$digest" = "$VERIFIED_DIGEST" ] \
+            || { echo "::error::this IPA is not the one the verify job checked"; exit 1; }
+
+          # State of the release for $TAG, drafts included; empty if there is none, an error if
+          # several releases claim the tag (drafts can):
+          #   "<draft> <prerelease> <target> <id of the uploaded asset named $IPA, or -> <number of .ipa assets>"
+          # A sideloader takes the first .ipa of the latest full release, so only a release that is
+          # neither draft nor pre-release and holds exactly this one .ipa counts as published.
+          release_state() {
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              | jq -rs --arg tag "$TAG" --arg ipa "$IPA" 'add | map(select(.tag_name == $tag))
+                  | if length > 1 then error("more than one release uses tag " + $tag) else .[0] end | select(. != null)
+                  | "\(.draft) \(.prerelease) \(.target_commitish) \([.assets[] | select(.name == $ipa and .state == "uploaded") | .id][0] // "-") \([.assets[] | select(.name | ascii_downcase | endswith(".ipa"))] | length)"'
+          }
+          # SHA-256 of the bytes a release asset really holds: downloaded and hashed, not read from
+          # metadata. Fails, printing nothing, when the download fails.
+          asset_digest() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/$1" -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/release-asset.ipa" || return 1
+            sha256sum "$RUNNER_TEMP/release-asset.ipa" | cut -d' ' -f1
+          }
+          # commit the tag points to; empty only when GitHub confirms there is no such tag
+          tag_commit() {
+            local out
+            if out="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.sha' 2>"$RUNNER_TEMP/tag.err")"; then
+              printf '%s\n' "$out"
+            elif grep -q 'HTTP 404' "$RUNNER_TEMP/tag.err"; then
+              return 0
+            else
+              cat "$RUNNER_TEMP/tag.err" >&2; return 1
+            fi
+          }
+
+          # the tag names the commit, so it may only already exist on this commit
+          tag_sha="$(tag_commit)" || { echo "::error::could not look up tag ${TAG}"; exit 1; }
+          [ -z "$tag_sha" ] || [ "$tag_sha" = "$SHA" ] || { echo "::error::tag ${TAG} already exists and does not point to ${SHA}"; exit 1; }
+          state="$(release_state)"
+          published_digest="$digest"
+          if [ -z "$state" ]; then
+            {
+              echo "Unsigned iOS build of PiliPlus ${APP_VERSION} (build ${BUILD_NUMBER}) with this fork's Picture in Picture and AV1 hardware decoding fixes. Re-sign it with a sideloader before installing."
+              echo
+              echo "- Commit: ${SHA}"
+              echo "- SHA-256: \`${digest}\`"
+              echo "- Build and checks: ${RUN_URL}"
+            } > "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" "$IPA" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+              --title "PiliPlus ${APP_VERSION} (${BUILD_NUMBER}) iOS unsigned" --notes-file "$RUNNER_TEMP/notes.md" --latest
+          else
+            # an earlier attempt got this far: finish it, but never replace an IPA that is already there
+            read -r draft prerelease target asset_id ipa_count <<< "$state"
+            [ "$target" = "$SHA" ] || [ "$tag_sha" = "$SHA" ] || { echo "::error::release ${TAG} exists for another commit"; exit 1; }
+            stable=false
+            if [ "$draft" = "false" ] && [ "$prerelease" = "false" ]; then stable=true; fi
+            if [ "$asset_id" = "-" ]; then
+              [ "$ipa_count" -eq 0 ] || { echo "::error::release ${TAG} holds an .ipa that is not a complete ${IPA}; remove it or the release and run again"; exit 1; }
+              gh release upload "$TAG" "$IPA" --repo "$GITHUB_REPOSITORY"
+            else
+              [ "$ipa_count" -eq 1 ] || { echo "::error::release ${TAG} holds more than one .ipa; remove the extra one and run again"; exit 1; }
+              existing="$(asset_digest "$asset_id")" || { echo "::error::could not read the IPA that release ${TAG} holds"; exit 1; }
+              if [ "$existing" = "$digest" ]; then
+                echo "release ${TAG} already holds this IPA"
+              elif [ "$stable" = "true" ]; then
+                # the same commit was built again: the bytes differ, the published release stays
+                echo "::notice title=Release kept::${TAG} is already published with another build of this commit; it was left as it is"
+                published_digest="$existing"
+              else
+                # a draft or pre-release with other bytes is not something to promote
+                echo "::error::unpublished release ${TAG} holds a different IPA (${existing}) than the verified one; delete it and run again"; exit 1
+              fi
+            fi
+            [ "$stable" = "true" ] || gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
+          fi
+
+          # done only when it is really out: a full release on this commit whose only .ipa is the expected bytes
+          for attempt in 1 2 3; do
+            tag_sha="$(tag_commit)" || tag_sha=""
+            state="$(release_state)" || state=""
+            read -r draft prerelease target asset_id ipa_count <<< "${state:-? ? ? - 0}"
+            have=""
+            if [ "$asset_id" != "-" ]; then have="$(asset_digest "$asset_id")" || have=""; fi
+            if [ "$tag_sha" = "$SHA" ] && [ "$draft" = "false" ] && [ "$prerelease" = "false" ] && [ "$ipa_count" = "1" ] \
+              && [ -n "$have" ] && [ "$have" = "$published_digest" ]; then
+              break
+            fi
+            [ "$attempt" -lt 3 ] || { echo "::error::release ${TAG} is not fully published (tag ${tag_sha:-missing}, state: ${state:-missing}, asset digest ${have:-unread})"; exit 1; }
+            sleep 5
+          done
+          echo "- Release \`${TAG}\` is published (SHA-256 \`${published_digest}\`)" >> "$GITHUB_STEP_SUMMARY"
