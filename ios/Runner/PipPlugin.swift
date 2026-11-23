@@ -10,6 +10,10 @@ import UIKit
 /// map texture ids to textures and to get notified of new frames. Frames of the
 /// tracked texture are copied and fed to an `AVSampleBufferDisplayLayer`, which
 /// is used as the PiP content source (iOS 15+).
+///
+/// Threading: `PipPlugin`, `PipSession` and `TextureTracker` are main thread
+/// only. `FramePipeline` owns everything that touches frames and confines it
+/// to its serial queue; the two only exchange messages.
 final class PipPlugin: NSObject, FlutterPlugin {
   private static let channelName = "com.example.piliplus/pip"
 
@@ -115,10 +119,9 @@ final class PipPlugin: NSObject, FlutterPlugin {
 
 @available(iOS 15.0, *)
 private final class PipSession: NSObject {
-  /// Upper bound of the longest side of the frames sent to PiP.
-  private static let maxDimension = 1920.0
-  /// Frame interval used while armed for auto-enter but not yet in PiP.
-  private static let idleFrameInterval = 0.25
+  /// Frame interval used while armed for auto-enter but not yet in PiP: the
+  /// layer is not visible then, it only needs a recent frame to start from.
+  private static let idleFrameInterval = 2.0
 
   let textureId: Int64
   var onStop: (() -> Void)?
@@ -150,19 +153,8 @@ private final class PipSession: NSObject {
   private var lastFrameTime: CFTimeInterval = 0
   /// Whether a frame has been enqueued, PiP shows a black window otherwise.
   private var hasFrame = false
-
-  // Accessed on `frameQueue` only.
-  private let frameQueue = DispatchQueue(label: "com.example.piliplus.pip.frame")
-  private let ciContext = CIContext(options: [
-    .workingColorSpace: NSNull(),
-    .outputColorSpace: NSNull(),
-    .cacheIntermediates: false,
-  ])
-  private var pool: CVPixelBufferPool?
-  private var poolSize = CGSize.zero
-  private var formatDescription: CMVideoFormatDescription?
-  /// Size of the PiP window in pixels, zero until known.
-  private var renderSize = CGSize.zero
+  private var invalidated = false
+  private let pipeline: FramePipeline
 
   init(textureId: Int64, sendEvent: @escaping (String, Any?) -> Void) {
     let sourceView = SampleBufferView()
@@ -182,6 +174,7 @@ private final class PipSession: NSObject {
     self.sourceView = sourceView
     self.displayLayer = displayLayer
     self.timebase = timebase!
+    self.pipeline = FramePipeline(displayLayer: displayLayer, timebase: timebase!)
     super.init()
 
     controller = AVPictureInPictureController(
@@ -297,6 +290,7 @@ private final class PipSession: NSObject {
   }
 
   func invalidate() {
+    invalidated = true
     pendingStart = false
     possibleObservation?.invalidate()
     observers.forEach(NotificationCenter.default.removeObserver)
@@ -311,151 +305,40 @@ private final class PipSession: NSObject {
     // The content source retains its playback delegate (`self`).
     controller.contentSource = nil
     sourceView.removeFromSuperview()
+    // Releases every frame still held by the layer and the buffer pool.
+    pipeline.shutdown()
   }
 
   // MARK: Frames
 
   /// Must be called on the main thread.
   func frameAvailable(force: Bool = false) {
-    guard !frameInFlight, let texture = TextureTracker.texture(for: textureId) else {
-      return
+    guard !invalidated, !frameInFlight else { return }
+    if !isActive {
+      // Nothing shows the layer while in background without PiP, so what is
+      // enqueued then would only pile up.
+      if UIApplication.shared.applicationState == .background { return }
+      // One frame to start from, then only an occasional refresh.
+      if !force && hasFrame && !pendingStart
+        && CACurrentMediaTime() - lastFrameTime < Self.idleFrameInterval
+      {
+        return
+      }
     }
-    let now = CACurrentMediaTime()
-    if !force && !isActive && now - lastFrameTime < Self.idleFrameInterval {
-      return
-    }
-    guard let source = texture.copyPixelBuffer()?.takeRetainedValue() else { return }
-    lastFrameTime = now
+    guard let texture = TextureTracker.texture(for: textureId),
+      let source = texture.copyPixelBuffer()?.takeRetainedValue()
+    else { return }
+    lastFrameTime = CACurrentMediaTime()
     frameInFlight = true
     // The source buffer is reused by mpv a few frames later, so it is copied
     // (and downscaled if needed) instead of being handed to the layer as is.
-    frameQueue.async { [weak self] in
+    pipeline.submit(source) { [weak self] enqueued in
       guard let self else { return }
-      var enqueued = false
-      if let copy = self.copy(source), let sampleBuffer = self.makeSampleBuffer(copy) {
-        enqueued = self.enqueue(sampleBuffer)
-      }
-      DispatchQueue.main.async {
-        self.frameInFlight = false
-        if enqueued && !self.hasFrame {
-          self.hasFrame = true
-          self.updateAutoEnter()
-          self.startIfPending()
-        }
-      }
-    }
-  }
-
-  private func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
-    let sourceWidth = Double(CVPixelBufferGetWidth(source))
-    let sourceHeight = Double(CVPixelBufferGetHeight(source))
-    guard sourceWidth > 0, sourceHeight > 0 else { return nil }
-    var scale = min(1, Self.maxDimension / max(sourceWidth, sourceHeight))
-    if renderSize.width > 0 && renderSize.height > 0 {
-      // No need for more pixels than the PiP window has.
-      scale = min(
-        scale,
-        max(renderSize.width / sourceWidth, renderSize.height / sourceHeight)
-      )
-    }
-    let size = CGSize(
-      width: (sourceWidth * scale).rounded(),
-      height: (sourceHeight * scale).rounded()
-    )
-
-    if pool == nil || poolSize != size {
-      pool = nil
-      poolSize = size
-      let attributes: [CFString: Any] = [
-        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-        kCVPixelBufferWidthKey: Int(size.width),
-        kCVPixelBufferHeightKey: Int(size.height),
-        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-        kCVPixelBufferMetalCompatibilityKey: true,
-      ]
-      CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
-    }
-    guard let pool else { return nil }
-
-    var output: CVPixelBuffer?
-    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
-    guard let output else { return nil }
-
-    var image = CIImage(cvPixelBuffer: source)
-    if scale < 1 {
-      image = image.transformed(
-        by: CGAffineTransform(
-          scaleX: size.width / sourceWidth,
-          y: size.height / sourceHeight
-        )
-      )
-    }
-    ciContext.render(image, to: output)
-    return output
-  }
-
-  private func makeSampleBuffer(_ pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
-    let matches =
-      formatDescription.map {
-        CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: pixelBuffer)
-      } ?? false
-    if !matches {
-      formatDescription = nil
-      CMVideoFormatDescriptionCreateForImageBuffer(
-        allocator: nil,
-        imageBuffer: pixelBuffer,
-        formatDescriptionOut: &formatDescription
-      )
-    }
-    guard let formatDescription else { return nil }
-
-    var timing = CMSampleTimingInfo(
-      duration: .invalid,
-      presentationTimeStamp: CMTimebaseGetTime(timebase),
-      decodeTimeStamp: .invalid
-    )
-    var sampleBuffer: CMSampleBuffer?
-    CMSampleBufferCreateReadyWithImageBuffer(
-      allocator: nil,
-      imageBuffer: pixelBuffer,
-      formatDescription: formatDescription,
-      sampleTiming: &timing,
-      sampleBufferOut: &sampleBuffer
-    )
-    guard let sampleBuffer else { return nil }
-
-    // Frames are already paced by mpv.
-    if let attachments = CMSampleBufferGetSampleAttachmentsArray(
-      sampleBuffer,
-      createIfNecessary: true
-    ), CFArrayGetCount(attachments) > 0 {
-      let dict = unsafeBitCast(
-        CFArrayGetValueAtIndex(attachments, 0),
-        to: CFMutableDictionary.self
-      )
-      CFDictionarySetValue(
-        dict,
-        Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
-      )
-    }
-    return sampleBuffer
-  }
-
-  private func enqueue(_ sampleBuffer: CMSampleBuffer) -> Bool {
-    if #available(iOS 17.0, *) {
-      let renderer = displayLayer.sampleBufferRenderer
-      if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-        renderer.flush()
-      }
-      renderer.enqueue(sampleBuffer)
-      return renderer.status != .failed
-    } else {
-      if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
-        displayLayer.flush()
-      }
-      displayLayer.enqueue(sampleBuffer)
-      return displayLayer.status != .failed
+      self.frameInFlight = false
+      guard !self.invalidated, enqueued, !self.hasFrame else { return }
+      self.hasFrame = true
+      self.updateAutoEnter()
+      self.startIfPending()
     }
   }
 
@@ -523,6 +406,8 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     stopRequested = false
     restoring = false
     sendEvent("onStateChanged", ["active": false, "closed": closed])
+    // Nothing consumes the frames queued for the PiP window anymore.
+    pipeline.flush()
     DispatchQueue.main.async { [weak self] in self?.onStop?() }
   }
 }
@@ -564,9 +449,8 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
       width: Double(newRenderSize.width) * scale,
       height: Double(newRenderSize.height) * scale
     )
-    frameQueue.async { [weak self] in
-      self?.renderSize = size
-      DispatchQueue.main.async { self?.frameAvailable(force: true) }
+    pipeline.setRenderSize(size) { [weak self] in
+      self?.frameAvailable(force: true)
     }
   }
 
@@ -588,6 +472,289 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) -> Bool {
     false
+  }
+}
+
+// MARK: - Frame pipeline
+
+/// Copies frames into a bounded pool of pixel buffers and feeds them to the
+/// display layer.
+///
+/// A pool buffer is only recycled once every holder has released it, and that
+/// includes the system processes rendering the layer. The pool is therefore
+/// capped: when the system does not give buffers back, frames are dropped and
+/// the layer is flushed instead of allocating without limit, which ends with
+/// the system killing its render server.
+///
+/// The methods can be called from any thread, the state is only accessed on
+/// `queue`. Completion handlers are called on the main thread.
+@available(iOS 15.0, *)
+private final class FramePipeline {
+  /// Upper bound of the longest side of the frames sent to PiP.
+  private static let maxDimension = 1920.0
+  /// Same, while the size of the PiP window is not known yet.
+  private static let idleMaxDimension = 960.0
+  /// Number of pixel buffers that may be alive at once.
+  private static let maxBufferCount = 6
+  /// Number of consecutive dropped frames after which the layer is flushed again.
+  private static let flushAfterDrops = 30
+
+  private let queue = DispatchQueue(label: "com.example.piliplus.pip.frame")
+  private let timebase: CMTimebase
+  private let ciContext = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: NSNull(),
+    .cacheIntermediates: false,
+  ])
+  private let allocationAttributes =
+    [kCVPixelBufferPoolAllocationThresholdKey: FramePipeline.maxBufferCount] as CFDictionary
+  /// `nil` once shut down.
+  private var displayLayer: AVSampleBufferDisplayLayer?
+  private var pool: CVPixelBufferPool?
+  private var poolSize = CGSize.zero
+  private var formatDescription: CMVideoFormatDescription?
+  /// Size of the PiP window in pixels, zero until known.
+  private var renderSize = CGSize.zero
+  private var consecutiveDrops = 0
+  private var lastPresentationTime = CMTime.invalid
+  private var lastLogTime: CFTimeInterval = 0
+
+  init(displayLayer: AVSampleBufferDisplayLayer, timebase: CMTimebase) {
+    self.displayLayer = displayLayer
+    self.timebase = timebase
+  }
+
+  /// Copies `source` and enqueues the copy, `completion` tells whether it was.
+  func submit(_ source: CVPixelBuffer, completion: @escaping (Bool) -> Void) {
+    queue.async {
+      // Temporary objects keep buffers of the pool alive until they are released.
+      let enqueued = autoreleasepool { self.process(source) }
+      DispatchQueue.main.async { completion(enqueued) }
+    }
+  }
+
+  func setRenderSize(_ size: CGSize, completion: @escaping () -> Void) {
+    queue.async {
+      self.renderSize = size
+      DispatchQueue.main.async(execute: completion)
+    }
+  }
+
+  /// Discards the frames queued in the layer, the displayed one is kept.
+  func flush() {
+    queue.async { self.flushLayer(removingImage: false) }
+  }
+
+  /// Releases all frames and buffers, nothing is enqueued afterwards.
+  func shutdown() {
+    queue.async {
+      self.flushLayer(removingImage: true)
+      self.pool = nil
+      self.formatDescription = nil
+      self.ciContext.clearCaches()
+      // The layer backs a view, so hand this reference over to the main thread
+      // instead of dropping it here.
+      DispatchQueue.main.async { [layer = self.displayLayer] in
+        withExtendedLifetime(layer) {}
+      }
+      self.displayLayer = nil
+    }
+  }
+
+  // MARK: On `queue`
+
+  private func process(_ source: CVPixelBuffer) -> Bool {
+    guard let displayLayer else { return false }
+    if Self.needsFlush(displayLayer) {
+      flushLayer(removingImage: false)
+    }
+    guard Self.isReady(displayLayer) else {
+      dropped("the layer is not ready")
+      return false
+    }
+    guard let copy = copy(source), let sampleBuffer = makeSampleBuffer(copy) else {
+      return false
+    }
+    let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if lastPresentationTime.isValid && CMTimeCompare(time, lastPresentationTime) < 0 {
+      // Seeked backwards: the frames queued for a later time are stale.
+      flushLayer(removingImage: false)
+    }
+    let enqueued = Self.enqueue(sampleBuffer, to: displayLayer)
+    if enqueued {
+      lastPresentationTime = time
+      consecutiveDrops = 0
+    }
+    return enqueued
+  }
+
+  private func dropped(_ reason: String) {
+    consecutiveDrops += 1
+    // Flushing makes the layer give up the frames it holds, and with them the
+    // buffers. Right away, then again for as long as nothing gets through.
+    if consecutiveDrops % Self.flushAfterDrops == 1 {
+      flushLayer(removingImage: false)
+    }
+    let now = CACurrentMediaTime()
+    if now - lastLogTime >= 5 {
+      lastLogTime = now
+      NSLog("PipPlugin: dropped \(consecutiveDrops) frame(s), \(reason)")
+    }
+  }
+
+  private func flushLayer(removingImage: Bool) {
+    lastPresentationTime = .invalid
+    guard let displayLayer else { return }
+    if #available(iOS 17.0, *) {
+      displayLayer.sampleBufferRenderer.flush(
+        removingDisplayedImage: removingImage,
+        completionHandler: nil
+      )
+    } else if removingImage {
+      displayLayer.flushAndRemoveImage()
+    } else {
+      displayLayer.flush()
+    }
+  }
+
+  private static func needsFlush(_ displayLayer: AVSampleBufferDisplayLayer) -> Bool {
+    if #available(iOS 17.0, *) {
+      let renderer = displayLayer.sampleBufferRenderer
+      return renderer.status == .failed || renderer.requiresFlushToResumeDecoding
+    } else {
+      return displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding
+    }
+  }
+
+  private static func isReady(_ displayLayer: AVSampleBufferDisplayLayer) -> Bool {
+    if #available(iOS 17.0, *) {
+      return displayLayer.sampleBufferRenderer.isReadyForMoreMediaData
+    } else {
+      return displayLayer.isReadyForMoreMediaData
+    }
+  }
+
+  private static func enqueue(
+    _ sampleBuffer: CMSampleBuffer,
+    to displayLayer: AVSampleBufferDisplayLayer
+  ) -> Bool {
+    if #available(iOS 17.0, *) {
+      let renderer = displayLayer.sampleBufferRenderer
+      renderer.enqueue(sampleBuffer)
+      return renderer.status != .failed
+    } else {
+      displayLayer.enqueue(sampleBuffer)
+      return displayLayer.status != .failed
+    }
+  }
+
+  private func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    let sourceWidth = Double(CVPixelBufferGetWidth(source))
+    let sourceHeight = Double(CVPixelBufferGetHeight(source))
+    guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+    let hasRenderSize = renderSize.width > 0 && renderSize.height > 0
+    let maxDimension = hasRenderSize ? Self.maxDimension : Self.idleMaxDimension
+    var scale = min(1, maxDimension / max(sourceWidth, sourceHeight))
+    if hasRenderSize {
+      // No need for more pixels than the PiP window has.
+      scale = min(
+        scale,
+        max(renderSize.width / sourceWidth, renderSize.height / sourceHeight)
+      )
+    }
+    let size = CGSize(
+      width: max(1, (sourceWidth * scale).rounded()),
+      height: max(1, (sourceHeight * scale).rounded())
+    )
+
+    if pool == nil || poolSize != size {
+      // Frames of the previous size keep the buffers of the previous pool alive.
+      flushLayer(removingImage: false)
+      pool = nil
+      poolSize = size
+      let attributes: [CFString: Any] = [
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey: Int(size.width),
+        kCVPixelBufferHeightKey: Int(size.height),
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        kCVPixelBufferMetalCompatibilityKey: true,
+      ]
+      CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
+    }
+    guard let pool else { return nil }
+
+    var output: CVPixelBuffer?
+    let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+      nil,
+      pool,
+      allocationAttributes,
+      &output
+    )
+    if status == kCVReturnWouldExceedAllocationThreshold {
+      dropped("all \(Self.maxBufferCount) buffers are in use")
+      return nil
+    }
+    guard status == kCVReturnSuccess, let output else { return nil }
+
+    var image = CIImage(cvPixelBuffer: source)
+    if scale < 1 {
+      image = image.transformed(
+        by: CGAffineTransform(
+          scaleX: size.width / sourceWidth,
+          y: size.height / sourceHeight
+        )
+      )
+    }
+    ciContext.render(image, to: output)
+    return output
+  }
+
+  private func makeSampleBuffer(_ pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+    let matches =
+      formatDescription.map {
+        CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: pixelBuffer)
+      } ?? false
+    if !matches {
+      formatDescription = nil
+      CMVideoFormatDescriptionCreateForImageBuffer(
+        allocator: nil,
+        imageBuffer: pixelBuffer,
+        formatDescriptionOut: &formatDescription
+      )
+    }
+    guard let formatDescription else { return nil }
+
+    var timing = CMSampleTimingInfo(
+      duration: .invalid,
+      presentationTimeStamp: CMTimebaseGetTime(timebase),
+      decodeTimeStamp: .invalid
+    )
+    var sampleBuffer: CMSampleBuffer?
+    CMSampleBufferCreateReadyWithImageBuffer(
+      allocator: nil,
+      imageBuffer: pixelBuffer,
+      formatDescription: formatDescription,
+      sampleTiming: &timing,
+      sampleBufferOut: &sampleBuffer
+    )
+    guard let sampleBuffer else { return nil }
+
+    // Frames are already paced by mpv.
+    if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+      sampleBuffer,
+      createIfNecessary: true
+    ), CFArrayGetCount(attachments) > 0 {
+      let dict = unsafeBitCast(
+        CFArrayGetValueAtIndex(attachments, 0),
+        to: CFMutableDictionary.self
+      )
+      CFDictionarySetValue(
+        dict,
+        Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+      )
+    }
+    return sampleBuffer
   }
 }
 
