@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       strict_av1_check:
-        description: "Fail the build if FFmpeg AV1 (dav1d / av1_videotoolbox) markers are missing"
+        description: "Fail if av1_videotoolbox / libdav1d / Avcodec ABI checks fail (push builds are always strict)"
         required: false
-        default: false
+        default: true
         type: boolean
   push:
     branches:
@@ -34,6 +34,10 @@ concurrency:
 
 env:
   IPA_SUFFIX: ios-pip-hwdec-av1-unsigned
+  # media_kit_libs_ios_video pin from pubspec.yaml (ShionjiART/media-kit, libmpv v0.39.0-av1.1, FFmpeg 8.0.3)
+  LIBMPV_PKG_REF: a947586e84a6d29acaa5eb1ca13e16eba923c98b
+  LIBMPV_XCFRAMEWORKS_VERSION: v0.39.0-av1.1
+  EXPECTED_AVCODEC_MAJOR: "62"
 
 jobs:
   build-ios-unsigned-ipa:
@@ -74,11 +78,35 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 iOS
 
+      # patch.ps1 runs `flutter pub get` but never checks its exit code (only `git apply` is checked),
+      # and the build below uses --no-pub, so assert the resolution here instead of failing later.
+      - name: Verify pub resolution
+        run: |
+          set -euo pipefail
+          test -s .dart_tool/package_config.json || { echo "::error::flutter pub get (in patch.ps1) did not produce .dart_tool/package_config.json"; exit 1; }
+          grep -q "media-kit-${LIBMPV_PKG_REF}" .dart_tool/package_config.json \
+            || { echo "::error::media_kit_libs_ios_video is not resolved to ${LIBMPV_PKG_REF}"; grep -n media_kit_libs_ios_video .dart_tool/package_config.json || true; exit 1; }
+          grep -A6 '^  media_kit_libs_ios_video:' pubspec.lock | tee "$RUNNER_TEMP/lock-entry.txt"
+          if ! grep -q "resolved-ref: ${LIBMPV_PKG_REF}" "$RUNNER_TEMP/lock-entry.txt" \
+            || ! grep -q 'ShionjiART/media-kit.git' "$RUNNER_TEMP/lock-entry.txt"; then
+            echo "::error::pubspec.lock entry for media_kit_libs_ios_video changed during pub get"; exit 1
+          fi
+          echo "pubspec.lock changes from pub get (geetest_ios.patch adds gt3_flutter_plugin on iOS):"
+          git --no-pager diff --stat -- pubspec.lock
+
       - name: Build iOS (no codesign)
         run: |
           set -euo pipefail
           flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
           test -d build/ios/iphoneos/Runner.app
+          # the podspec runs `system("make")` and ignores its result, so a failed libmpv download or sha256
+          # mismatch would otherwise only show up as missing frameworks in the app
+          mk_ios=ios/.symlinks/plugins/media_kit_libs_ios_video/ios
+          grep -q "^MPV_XCFRAMEWORKS_VERSION=${LIBMPV_XCFRAMEWORKS_VERSION}$" "$mk_ios/Makefile" \
+            || { echo "::error::media_kit_libs_ios_video Makefile is not libmpv ${LIBMPV_XCFRAMEWORKS_VERSION}"; exit 1; }
+          for xc in Mpv Avcodec Avformat Avutil Dav1d; do
+            test -d "$mk_ios/Frameworks/$xc.xcframework" || { echo "::error::libmpv download/extract failed: $xc.xcframework missing"; exit 1; }
+          done
           if ! git diff --quiet -- ios/Podfile.lock; then
             echo "::warning title=Podfile.lock drift::pod install changed ios/Podfile.lock"
             git --no-pager diff --stat -- ios/Podfile.lock
@@ -88,6 +116,9 @@ jobs:
         id: package
         run: |
           set -euo pipefail
+          # exported to $GITHUB_ENV by lib/scripts/build.ps1 ("<name>+<commit count>")
+          # shellcheck disable=SC2154
+          : "${version:?version not exported by lib/scripts/build.ps1}"
           safe_version="${version//+/-b}"
           ipa="PiliPlus-${safe_version}-${IPA_SUFFIX}.ipa"
           rm -rf Payload "$ipa"
@@ -104,7 +135,8 @@ jobs:
       - name: Verify IPA contents and Mach-O / FFmpeg
         env:
           IPA: ${{ steps.package.outputs.ipa }}
-          STRICT_AV1: ${{ github.event.inputs.strict_av1_check || 'false' }}
+          # push builds have no inputs: always strict
+          STRICT_AV1: ${{ github.event_name != 'workflow_dispatch' || inputs.strict_av1_check }}
         run: |
           set -euo pipefail
           check_dir="$RUNNER_TEMP/ipa-check"
@@ -141,35 +173,66 @@ jobs:
             echo "$fw: $(lipo -archs "$bin") $(file -b "$bin" | cut -c1-60)" | tee -a "$report"
           done
 
+          # strict: AV1 / ABI problems fail the job; otherwise they are warnings
+          gate() {
+            if [ "$STRICT_AV1" = "true" ]; then echo "::error::$1"; fail=1; else echo "::warning::$1 (non-strict run)"; fi
+          }
+          # "compatibility version" major of a dylib's own LC_ID_DYLIB (line 2 of otool -L)
+          id_major() { otool -L "$1" | awk 'NR==2{for(i=1;i<=NF;i++) if($i ~ /compatibility$/){v=$(i+2); sub(/\..*/,"",v); print v}}'; }
+
           avcodec="$app/Frameworks/Avcodec.framework/Avcodec"
-          if [ -f "$avcodec" ]; then
+          mpv="$app/Frameworks/Mpv.framework/Mpv"
+          if [ -f "$avcodec" ] && [ -f "$mpv" ]; then
             # dump once to a file: early-exit readers (grep -q / -m1) on a pipe trip SIGPIPE under pipefail
             strings -a "$avcodec" > "$RUNNER_TEMP/avcodec.strings"
             otool -L "$avcodec" > "$RUNNER_TEMP/avcodec.otool"
+            otool -L "$mpv" > "$RUNNER_TEMP/mpv.otool"
             {
               echo "== FFmpeg / libmpv ABI"
               echo "Avcodec dylib version: $(awk 'NR==2{print $NF}' "$RUNNER_TEMP/avcodec.otool" | tr -d ')')"
               echo "FFmpeg hwaccels compiled in: $(grep -E '^[a-z0-9]+_videotoolbox$' "$RUNNER_TEMP/avcodec.strings" | sort -u | tr '\n' ' ')"
               echo "Avcodec install name / deps:"; sed 1d "$RUNNER_TEMP/avcodec.otool"
-              echo "Mpv deps:"; otool -L "$app/Frameworks/Mpv.framework/Mpv" | sed 1d | grep -E 'Av|Sw|Placebo|Dav1d|VideoToolbox' || true
-              echo "== AV1 markers in Avcodec"
+              echo "Mpv deps:"; sed 1d "$RUNNER_TEMP/mpv.otool"
             } | tee -a "$report"
-            av1_ok=1
+
+            avcodec_major="$(id_major "$avcodec")"
+            if [ "$avcodec_major" = "$EXPECTED_AVCODEC_MAJOR" ]; then
+              echo "ok: Avcodec major $avcodec_major" | tee -a "$report"
+            else
+              echo "BAD: Avcodec major ${avcodec_major:-?} (expected $EXPECTED_AVCODEC_MAJOR)" | tee -a "$report"
+              gate "Avcodec ABI ${avcodec_major:-?} != expected $EXPECTED_AVCODEC_MAJOR"
+            fi
+
+            # (line 1 = file name, line 2 = Mpv's own LC_ID_DYLIB, then its dependencies)
+            # every @rpath framework Mpv links must be embedded, with the same compatibility major it was linked against
+            while read -r dep_path _ _ dep_compat _; do
+              dep="${dep_path#@rpath/}"; dep="${dep%%.framework/*}"
+              dep_bin="$app/Frameworks/$dep.framework/$dep"
+              want="${dep_compat%%.*}"
+              if [ ! -f "$dep_bin" ]; then
+                echo "BAD: Mpv -> $dep (not embedded)" | tee -a "$report"; gate "Mpv links $dep.framework, which is not embedded"; continue
+              fi
+              have="$(id_major "$dep_bin")"
+              if [ "$have" = "$want" ]; then
+                echo "ok: Mpv -> $dep major $want" | tee -a "$report"
+              else
+                echo "BAD: Mpv -> $dep linked against major $want, embedded major ${have:-?}" | tee -a "$report"
+                gate "ABI mismatch: Mpv -> $dep ($want vs ${have:-?})"
+              fi
+            done < <(awk 'NR>2 && $1 ~ /^@rpath\/.*\.framework\// {print}' "$RUNNER_TEMP/mpv.otool")
+
+            echo "== AV1 markers in Avcodec" | tee -a "$report"
             for marker in av1_videotoolbox libdav1d; do
               if grep -qx "$marker" "$RUNNER_TEMP/avcodec.strings"; then
                 echo "found: $marker" | tee -a "$report"
               else
-                echo "MISSING: $marker" | tee -a "$report"; av1_ok=0
+                echo "MISSING: $marker" | tee -a "$report"; gate "$marker missing in Avcodec"
               fi
             done
-            if grep -q VideoToolbox "$RUNNER_TEMP/avcodec.otool"; then
+            if grep -q '/VideoToolbox.framework/' "$RUNNER_TEMP/avcodec.otool"; then
               echo "Avcodec links VideoToolbox" | tee -a "$report"
             else
-              echo "Avcodec does NOT link VideoToolbox" | tee -a "$report"; av1_ok=0
-            fi
-            if [ "$av1_ok" -ne 1 ]; then
-              if [ "$STRICT_AV1" = "true" ]; then echo "::error::AV1 markers missing in Avcodec"; fail=1
-              else echo "::warning::AV1 markers missing in Avcodec (non-strict run)"; fi
+              echo "Avcodec does NOT link VideoToolbox" | tee -a "$report"; gate "Avcodec does not link VideoToolbox"
             fi
           fi
 
