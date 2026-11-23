@@ -1,0 +1,204 @@
+# Unsigned iOS .ipa for sideloading (IPASideloader / AltStore / SideStore re-sign it).
+#
+# Mirrors upstream PiliPlus 2.2.1 `.github/workflows/ios.yml` toolchain exactly:
+#   runner macos-26, Flutter from pubspec.yaml (3.47.9 stable), upstream build.ps1 + patch.ps1 iOS
+#   (Flutter SDK / material_ui / cupertino_ui patches + `flutter pub get`),
+#   `flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub`.
+# Adds: Payload packaging, IPA content + Mach-O + libmpv/FFmpeg (AV1/VideoToolbox) checks, SHA-256, artifact upload.
+#
+# Note: GitHub only lists workflow_dispatch workflows that exist on the default branch, so on this fork
+# the `push` trigger on the fix branch is what starts a build (or dispatch after this file reaches main).
+
+name: Build iOS unsigned IPA (sideload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      strict_av1_check:
+        description: "Fail the build if FFmpeg AV1 (dav1d / av1_videotoolbox) markers are missing"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - fix/ios-pip-hwdec-av1
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IPA_SUFFIX: ios-pip-hwdec-av1-unsigned
+
+jobs:
+  build-ios-unsigned-ipa:
+    name: Build unsigned iOS IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # build.ps1 uses `git rev-list --count HEAD` as the build number
+          fetch-depth: 0
+
+      - name: Setup flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+          # no cache: patch.ps1 patches $FLUTTER_ROOT in place, a cached patched SDK would make `git apply` fail
+
+      - name: Toolchain versions
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          flutter --version
+          dart --version
+          pod --version
+          pwsh --version
+          echo "Podfile.lock CocoaPods: $(grep '^COCOAPODS:' ios/Podfile.lock)"
+
+      - name: Set and Extract version
+        shell: pwsh
+        run: lib/scripts/build.ps1
+
+      - name: Apply Patch
+        shell: pwsh
+        run: lib/scripts/patch.ps1 iOS
+
+      - name: Build iOS (no codesign)
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
+          test -d build/ios/iphoneos/Runner.app
+          if ! git diff --quiet -- ios/Podfile.lock; then
+            echo "::warning title=Podfile.lock drift::pod install changed ios/Podfile.lock"
+            git --no-pager diff --stat -- ios/Podfile.lock
+          fi
+
+      - name: Package unsigned IPA
+        id: package
+        run: |
+          set -euo pipefail
+          safe_version="${version//+/-b}"
+          ipa="PiliPlus-${safe_version}-${IPA_SUFFIX}.ipa"
+          rm -rf Payload "$ipa"
+          mkdir Payload
+          ditto build/ios/iphoneos/Runner.app Payload/Runner.app
+          # same as upstream ios.yml: ad-hoc sign embedded frameworks so AltSign-based sideloaders accept them
+          find Payload/Runner.app/Frameworks -type d -name "*.framework" \
+            -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          zip -qr9y "$ipa" Payload
+          shasum -a 256 "$ipa" | tee "$ipa.sha256"
+          ls -lh "$ipa"
+          echo "ipa=$ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Verify IPA contents and Mach-O / FFmpeg
+        env:
+          IPA: ${{ steps.package.outputs.ipa }}
+          STRICT_AV1: ${{ github.event.inputs.strict_av1_check || 'false' }}
+        run: |
+          set -euo pipefail
+          check_dir="$RUNNER_TEMP/ipa-check"
+          rm -rf "$check_dir" && mkdir -p "$check_dir"
+          unzip -q "$IPA" -d "$check_dir"
+          app="$check_dir/Payload/Runner.app"
+          report="$RUNNER_TEMP/ipa-verify.txt"
+          : > "$report"
+          fail=0
+
+          {
+            echo "== IPA: $IPA"
+            echo "== Top-level entries"; unzip -Z1 "$IPA" | awk -F/ '{print $1}' | sort -u
+            echo "== Info.plist"
+            for key in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion CFBundleExecutable MinimumOSVersion; do
+              printf '%s = %s\n' "$key" "$(/usr/libexec/PlistBuddy -c "Print :$key" "$app/Info.plist" 2>/dev/null || echo MISSING)"
+            done
+            echo "UIBackgroundModes: $(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' "$app/Info.plist" 2>/dev/null | tr -s ' \n' ' ' || echo MISSING)"
+            echo "== Main executable"
+            lipo -archs "$app/Runner"
+            echo "== Embedded frameworks"
+            ls -1 "$app/Frameworks"
+          } | tee -a "$report"
+
+          [ "$(unzip -Z1 "$IPA" | awk -F/ '{print $1}' | sort -u)" = "Payload" ] || { echo "::error::IPA root must contain only Payload/"; fail=1; }
+          lipo -archs "$app/Runner" | grep -qw arm64 || { echo "::error::Runner is not arm64"; fail=1; }
+
+          required="App Flutter Mpv Avcodec Avformat Avutil Avfilter Swscale Swresample Dav1d Placebo media_kit_libs_ios_video media_kit_video media_kit_native_event_loop"
+          for fw in $required; do
+            bin="$app/Frameworks/$fw.framework/$fw"
+            if [ ! -f "$bin" ]; then
+              echo "::error::missing $fw.framework"; fail=1; continue
+            fi
+            echo "$fw: $(lipo -archs "$bin") $(file -b "$bin" | cut -c1-60)" | tee -a "$report"
+          done
+
+          avcodec="$app/Frameworks/Avcodec.framework/Avcodec"
+          if [ -f "$avcodec" ]; then
+            # dump once to a file: early-exit readers (grep -q / -m1) on a pipe trip SIGPIPE under pipefail
+            strings -a "$avcodec" > "$RUNNER_TEMP/avcodec.strings"
+            otool -L "$avcodec" > "$RUNNER_TEMP/avcodec.otool"
+            {
+              echo "== FFmpeg / libmpv ABI"
+              echo "Avcodec dylib version: $(awk 'NR==2{print $NF}' "$RUNNER_TEMP/avcodec.otool" | tr -d ')')"
+              echo "FFmpeg hwaccels compiled in: $(grep -E '^[a-z0-9]+_videotoolbox$' "$RUNNER_TEMP/avcodec.strings" | sort -u | tr '\n' ' ')"
+              echo "Avcodec install name / deps:"; sed 1d "$RUNNER_TEMP/avcodec.otool"
+              echo "Mpv deps:"; otool -L "$app/Frameworks/Mpv.framework/Mpv" | sed 1d | grep -E 'Av|Sw|Placebo|Dav1d|VideoToolbox' || true
+              echo "== AV1 markers in Avcodec"
+            } | tee -a "$report"
+            av1_ok=1
+            for marker in av1_videotoolbox libdav1d; do
+              if grep -qx "$marker" "$RUNNER_TEMP/avcodec.strings"; then
+                echo "found: $marker" | tee -a "$report"
+              else
+                echo "MISSING: $marker" | tee -a "$report"; av1_ok=0
+              fi
+            done
+            if grep -q VideoToolbox "$RUNNER_TEMP/avcodec.otool"; then
+              echo "Avcodec links VideoToolbox" | tee -a "$report"
+            else
+              echo "Avcodec does NOT link VideoToolbox" | tee -a "$report"; av1_ok=0
+            fi
+            if [ "$av1_ok" -ne 1 ]; then
+              if [ "$STRICT_AV1" = "true" ]; then echo "::error::AV1 markers missing in Avcodec"; fail=1
+              else echo "::warning::AV1 markers missing in Avcodec (non-strict run)"; fi
+            fi
+          fi
+
+          {
+            echo '### Unsigned IPA'
+            echo '```'
+            cat "$report"
+            cat "$IPA.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cp "$report" "${IPA%.ipa}.verify.txt"
+          exit "$fail"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: PiliPlus-ios-unsigned-ipa
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload verification report
+        if: always() && steps.package.outputs.ipa != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: PiliPlus-ios-unsigned-ipa-report
+          path: |
+            PiliPlus-*-unsigned.ipa.sha256
+            PiliPlus-*-unsigned.verify.txt
+          if-no-files-found: warn
+          retention-days: 14
