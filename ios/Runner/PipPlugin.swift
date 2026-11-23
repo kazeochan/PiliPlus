@@ -330,8 +330,9 @@ private final class PipSession: NSObject {
     else { return }
     lastFrameTime = CACurrentMediaTime()
     frameInFlight = true
-    // The source buffer is reused by mpv a few frames later, so it is copied
-    // (and downscaled if needed) instead of being handed to the layer as is.
+    // mpv renders into the source buffer again about a frame after it stops
+    // being the current one, so `submit` copies it (and downscales it if
+    // needed) before returning, the layer only ever gets the copy.
     pipeline.submit(source) { [weak self] enqueued in
       guard let self else { return }
       self.frameInFlight = false
@@ -486,10 +487,21 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
 /// the layer is flushed instead of allocating without limit, which ends with
 /// the system killing its render server.
 ///
-/// The methods can be called from any thread, the state is only accessed on
-/// `queue`. Completion handlers are called on the main thread.
+/// The methods can be called from any thread but `queue`, the state is only
+/// accessed on `queue`. The layer is only changed (enqueue, flush) by blocks
+/// running asynchronously on `queue`, so a caller waiting for a copy never
+/// waits for the layer. Completion handlers are called on the main thread.
 @available(iOS 15.0, *)
 private final class FramePipeline {
+  /// Result of copying a frame, the parts that change the layer are left to
+  /// `deliver(_:)`.
+  private enum Snapshot {
+    case copied(CVPixelBuffer)
+    case dropped(String)
+    case flushNeeded
+    case failed
+  }
+
   /// Upper bound of the longest side of the frames sent to PiP.
   private static let maxDimension = 1920.0
   /// Same, while the size of the PiP window is not known yet.
@@ -518,17 +530,23 @@ private final class FramePipeline {
   private var consecutiveDrops = 0
   private var lastPresentationTime = CMTime.invalid
   private var lastLogTime: CFTimeInterval = 0
+  /// Set when the pool was replaced, frames of the previous size still hold
+  /// its buffers until the layer is flushed.
+  private var flushBeforeEnqueue = false
 
   init(displayLayer: AVSampleBufferDisplayLayer, timebase: CMTimebase) {
     self.displayLayer = displayLayer
     self.timebase = timebase
   }
 
-  /// Copies `source` and enqueues the copy, `completion` tells whether it was.
+  /// Copies `source` before returning, `source` is not accessed afterwards.
+  /// Then enqueues the copy, `completion` tells whether it was.
   func submit(_ source: CVPixelBuffer, completion: @escaping (Bool) -> Void) {
+    dispatchPrecondition(condition: .notOnQueue(queue))
+    // Temporary objects keep buffers of the pool alive until they are released.
+    let snapshot = queue.sync { autoreleasepool { self.snapshot(source) } }
     queue.async {
-      // Temporary objects keep buffers of the pool alive until they are released.
-      let enqueued = autoreleasepool { self.process(source) }
+      let enqueued = autoreleasepool { self.deliver(snapshot) }
       DispatchQueue.main.async { completion(enqueued) }
     }
   }
@@ -563,18 +581,35 @@ private final class FramePipeline {
 
   // MARK: On `queue`
 
-  private func process(_ source: CVPixelBuffer) -> Bool {
+  /// Copies `source` unless the frame would be dropped anyway. Only reads the
+  /// state of the layer.
+  private func snapshot(_ source: CVPixelBuffer) -> Snapshot {
+    guard let displayLayer else { return .failed }
+    if Self.needsFlush(displayLayer) { return .flushNeeded }
+    guard Self.isReady(displayLayer) else { return .dropped("the layer is not ready") }
+    return copy(source)
+  }
+
+  private func deliver(_ snapshot: Snapshot) -> Bool {
     guard let displayLayer else { return false }
-    if Self.needsFlush(displayLayer) {
+    if flushBeforeEnqueue {
+      flushBeforeEnqueue = false
       flushLayer(removingImage: false)
     }
-    guard Self.isReady(displayLayer) else {
-      dropped("the layer is not ready")
+    let copy: CVPixelBuffer
+    switch snapshot {
+    case .copied(let pixelBuffer):
+      copy = pixelBuffer
+    case .dropped(let reason):
+      dropped(reason)
+      return false
+    case .flushNeeded:
+      flushLayer(removingImage: false)
+      return false
+    case .failed:
       return false
     }
-    guard let copy = copy(source), let sampleBuffer = makeSampleBuffer(copy) else {
-      return false
-    }
+    guard let sampleBuffer = makeSampleBuffer(copy) else { return false }
     let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     if lastPresentationTime.isValid && CMTimeCompare(time, lastPresentationTime) < 0 {
       // Seeked backwards: the frames queued for a later time are stale.
@@ -648,10 +683,10 @@ private final class FramePipeline {
     }
   }
 
-  private func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+  private func copy(_ source: CVPixelBuffer) -> Snapshot {
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
     let sourceHeight = Double(CVPixelBufferGetHeight(source))
-    guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+    guard sourceWidth > 0, sourceHeight > 0 else { return .failed }
     let hasRenderSize = renderSize.width > 0 && renderSize.height > 0
     let maxDimension = hasRenderSize ? Self.maxDimension : Self.idleMaxDimension
     var scale = min(1, maxDimension / max(sourceWidth, sourceHeight))
@@ -669,7 +704,7 @@ private final class FramePipeline {
 
     if pool == nil || poolSize != size {
       // Frames of the previous size keep the buffers of the previous pool alive.
-      flushLayer(removingImage: false)
+      flushBeforeEnqueue = true
       pool = nil
       poolSize = size
       let attributes: [CFString: Any] = [
@@ -681,7 +716,7 @@ private final class FramePipeline {
       ]
       CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
     }
-    guard let pool else { return nil }
+    guard let pool else { return .failed }
 
     var output: CVPixelBuffer?
     let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
@@ -691,10 +726,9 @@ private final class FramePipeline {
       &output
     )
     if status == kCVReturnWouldExceedAllocationThreshold {
-      dropped("all \(Self.maxBufferCount) buffers are in use")
-      return nil
+      return .dropped("all \(Self.maxBufferCount) buffers are in use")
     }
-    guard status == kCVReturnSuccess, let output else { return nil }
+    guard status == kCVReturnSuccess, let output else { return .failed }
 
     var image = CIImage(cvPixelBuffer: source)
     if scale < 1 {
@@ -705,8 +739,17 @@ private final class FramePipeline {
         )
       )
     }
-    ciContext.render(image, to: output)
-    return output
+    let destination = CIRenderDestination(pixelBuffer: output)
+    // Not color matched, as the context.
+    destination.colorSpace = nil
+    do {
+      // Waits for the GPU, the source must not be read after returning.
+      _ = try ciContext.startTask(toRender: image, to: destination).waitUntilCompleted()
+    } catch {
+      NSLog("PipPlugin: copying a frame failed: \(error)")
+      return .failed
+    }
+    return .copied(output)
   }
 
   private func makeSampleBuffer(_ pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
