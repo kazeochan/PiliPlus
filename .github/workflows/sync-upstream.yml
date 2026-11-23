@@ -1,0 +1,343 @@
+# Keeps this fork up to date with upstream PiliPlus without any personal access token.
+#
+#   1. Mirror: `main` is fast-forwarded to upstream `main` and missing upstream tags are copied.
+#   2. Merge:  upstream's latest published release is merged into the fix branch.
+#   3. Build:  after a merge, the unsigned iOS IPA is built from the merged commit and published
+#              as a GitHub release (see build-ios-unsigned-ipa.yml).
+#
+# Constraints this is built around (checked against GitHub on 2026-11-24):
+#   - `schedule` only runs from the default branch, so the fix branch is this fork's default branch.
+#   - GITHUB_TOKEN may not push a ref whose `.github/workflows/` differs from what the repository
+#     already has there. The merge therefore always keeps this fork's `.github/workflows/`
+#     (upstream workflow changes never reach the fix branch). `main` is fast-forwarded by a plain
+#     push when that is allowed and otherwise through GitHub's own fork sync API, which may carry
+#     upstream workflow changes. That API cannot be told "fast-forward only": if someone pushes to
+#     `main` in the instant between the check and the call, it merges, and the run says so.
+#   - A push made with GITHUB_TOKEN starts no workflow, so the build is called from here.
+#   - A conflicting merge is aborted, the fix branch is left as it is and an issue is opened.
+#   - A sync merge whose build was lost (cancelled, runner failure) is built again by a later run;
+#     a build that failed keeps its issue open and is not retried until that issue is closed.
+#   - GitHub disables schedules in public repositories after 60 days without repository activity;
+#     re-enable the workflow from the Actions tab if that ever happens.
+#
+# Nothing fetched from upstream is executed in the `sync` job; upstream ref names are validated
+# before use and file names only reach an issue body through a file.
+
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: bggRGjQaUbCoE/PiliPlus
+  # upstream's default branch: the fork sync API always syncs from it
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: main
+  TARGET_BRANCH: fix/ios-pip-hwdec-av1
+  # same value as in build-ios-unsigned-ipa.yml: it names the IPA a finished release must hold
+  IPA_SUFFIX: ios-pip-hwdec-av1-unsigned
+  CONFLICT_ISSUE: "[sync-upstream] Merge conflict"
+  BUILD_ISSUE: "[sync-upstream] Build failed"
+
+jobs:
+  sync:
+    name: Mirror and merge upstream
+    if: github.repository == 'kazeochan/PiliPlus'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      build: ${{ steps.merge.outputs.build }}
+      sha: ${{ steps.merge.outputs.sha }}
+      release: ${{ steps.merge.outputs.release }}
+    steps:
+      - name: Checkout the fix branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # upstream tags go to their own namespace: they never overwrite this fork's tags
+          git fetch --quiet --no-tags --prune upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}" \
+            '+refs/tags/*:refs/upstream-tags/*'
+          echo "upstream ${UPSTREAM_BRANCH}: $(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+
+      # Best effort: a problem here is reported as a warning and never blocks the merge below.
+      - name: Mirror upstream branch and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          warn() {
+            echo "::warning title=Upstream mirror::$1"
+            echo "- Mirror: $1" >> "$GITHUB_STEP_SUMMARY"
+          }
+          gh auth setup-git
+
+          upstream_tip="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          mirror_tip="$(git ls-remote origin "refs/heads/${MIRROR_BRANCH}" | cut -f1)"
+          if [ "$mirror_tip" = "$upstream_tip" ]; then
+            echo "${MIRROR_BRANCH} already matches upstream"
+          elif [ -z "$mirror_tip" ]; then
+            warn "branch ${MIRROR_BRANCH} does not exist in this fork; not mirrored"
+          elif ! git fetch --quiet --no-tags origin "$mirror_tip" || ! git merge-base --is-ancestor "$mirror_tip" "$upstream_tip"; then
+            warn "${MIRROR_BRANCH} has commits that are not in upstream; left as it is"
+          elif git push --quiet origin "${upstream_tip}:refs/heads/${MIRROR_BRANCH}" 2>/dev/null; then
+            # a push can only fast-forward; it is refused when upstream changed workflow files
+            echo "${MIRROR_BRANCH} fast-forwarded to upstream"
+          elif message="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f "branch=${MIRROR_BRANCH}" --jq '.merge_type' 2>&1)"; then
+            echo "${MIRROR_BRANCH} synced from upstream (${message})"
+            # the API has no fast-forward-only mode: a commit landing on the branch between the check
+            # above and this call is merged, not rejected, and cannot be undone from here
+            [ "$message" != "merge" ] || warn "${MIRROR_BRANCH} changed during the sync and now has a merge commit; it no longer mirrors upstream exactly"
+          else
+            warn "GitHub could not sync ${MIRROR_BRANCH} from upstream; use Sync fork on the repository page"
+            printf '%s\n' "$message" | head -n 5
+          fi
+
+          # "new <name>" for upstream tags this fork lacks, "changed <name>" where both exist but differ
+          git ls-remote --tags --refs origin > "$RUNNER_TEMP/origin-tags.txt"
+          git for-each-ref --format='%(objectname) refs/tags/%(refname:strip=2)' refs/upstream-tags > "$RUNNER_TEMP/upstream-tags.txt"
+          refspecs=()
+          skipped=0
+          changed=0
+          while read -r state ref; do
+            name="${ref#refs/tags/}"
+            # *-pip.* is where this fork's own release tags live: never taken from upstream
+            if [[ ! "$name" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || [[ "$name" == *-pip.* ]]; then
+              skipped=$((skipped + 1))
+            elif [ "$state" = "new" ]; then
+              refspecs+=("refs/upstream-tags/${name}:refs/tags/${name}")
+            else
+              changed=$((changed + 1))
+            fi
+          done < <(awk 'FILENAME == ARGV[1] { have[$2] = $1; next }
+                        !($2 in have) { print "new", $2; next }
+                        have[$2] != $1 { print "changed", $2 }' "$RUNNER_TEMP/origin-tags.txt" "$RUNNER_TEMP/upstream-tags.txt")
+          [ "$skipped" -eq 0 ] || warn "$skipped upstream tag(s) with unusual or reserved names were not copied"
+          [ "$changed" -eq 0 ] || warn "$changed tag(s) point elsewhere than upstream's; left as they are"
+          if [ "${#refspecs[@]}" -eq 0 ]; then
+            echo "no new upstream tags"
+          elif git push origin "${refspecs[@]}"; then
+            echo "copied ${#refspecs[@]} new upstream tag(s)"
+          else
+            warn "some of ${#refspecs[@]} new upstream tag(s) were not accepted; the next run retries"
+          fi
+
+      - name: Merge upstream's latest release
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # number of the open issue this workflow opened whose title starts with $1 (empty if none)
+          find_issue() {
+            gh api -X GET "repos/${GITHUB_REPOSITORY}/issues" -f state=open -f 'creator=github-actions[bot]' -F per_page=100 \
+              | jq -r --arg prefix "$1" '[.[] | select(.pull_request == null and (.title | startswith($prefix)))][0] | select(. != null) | "\(.number)\t\(.title)"'
+          }
+          # housekeeping only: it runs after the outputs are written and never fails the job,
+          # so a problem here cannot keep a merged release from being built
+          close_issue() {
+            local found
+            if ! found="$(find_issue "$1")"; then
+              echo "::warning::could not look up the open issue \"$1\"; close it by hand if it is resolved"
+              return 0
+            fi
+            [ -n "$found" ] || return 0
+            gh issue close "${found%%$'\t'*}" --repo "$GITHUB_REPOSITORY" --comment "$2" \
+              || echo "::warning::could not close issue #${found%%$'\t'*}; close it by hand"
+          }
+
+          # upstream's latest published release (drafts and pre-releases are never "latest"); its tag
+          # must look like a version, exist upstream and sit on upstream's main branch
+          release="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
+          [[ "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::upstream's latest release has an unexpected tag name"; exit 1; }
+          release_sha="$(git rev-parse --verify --quiet "refs/upstream-tags/${release}^{commit}")" \
+            || { echo "::error::upstream has no tag ${release} for its latest release"; exit 1; }
+          git merge-base --is-ancestor "$release_sha" "refs/remotes/upstream/${UPSTREAM_BRANCH}" \
+            || { echo "::error::upstream release ${release} is not on upstream ${UPSTREAM_BRANCH}"; exit 1; }
+          echo "latest upstream release: ${release} (${release_sha})"
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$release_sha" HEAD; then
+            echo "${TARGET_BRANCH} already contains upstream ${release}"
+            echo "- ${TARGET_BRANCH} already contains upstream ${release}" >> "$GITHUB_STEP_SUMMARY"
+            # Recover a lost build: the branch tip is still the merge this workflow made for this
+            # release, no release with an IPA was published from that commit, and no open build
+            # issue names that commit as failing.
+            head_sha="$(git rev-parse HEAD)"
+            build=false
+            if [ "$(git rev-parse --verify --quiet 'HEAD^2' || true)" = "$release_sha" ] \
+              && [ "$(git log -1 --format=%s)" = "chore(sync): merge upstream ${release}" ]; then
+              # the release build-ios-unsigned-ipa.yml makes for this commit, by the same rules: its tag
+              # points to this commit, and it is a full release (the kind "latest release" returns)
+              # whose only .ipa is the expected file
+              app_version="$(sed -n -E 's/^[[:space:]]*version:[[:space:]]*([0-9]+(\.[0-9]+){1,3}).*/\1/p' pubspec.yaml | head -n 1)"
+              build_number="$(git rev-list --count HEAD)"
+              expected_tag="${app_version}-pip.${build_number}-${head_sha:0:9}"
+              expected_ipa="PiliPlus-${app_version}-b${build_number}-${IPA_SUFFIX}.ipa"
+              tag_sha="$(git ls-remote origin "refs/tags/${expected_tag}" | cut -f1)"
+              published=""
+              if [ "$tag_sha" = "$head_sha" ]; then
+                published="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+                  | jq -rs --arg tag "$expected_tag" --arg ipa "$expected_ipa" 'add | map(select(.tag_name == $tag
+                      and .draft == false and .prerelease == false
+                      and ([.assets[] | select(.name | ascii_downcase | endswith(".ipa"))]
+                           | (length == 1 and .[0].name == $ipa and .[0].state == "uploaded"))))[0]
+                      | select(. != null) | .tag_name')"
+              fi
+              failing="$(gh api -X GET "repos/${GITHUB_REPOSITORY}/issues" -f state=open -f 'creator=github-actions[bot]' -F per_page=100 \
+                | jq -r --arg prefix "$BUILD_ISSUE" --arg sha "$head_sha" '[.[] | select(.pull_request == null
+                    and (.title | startswith($prefix)) and ((.body // "") | contains($sha)))][0] | select(. != null) | .number')"
+              if [ -n "$published" ]; then
+                echo "its release is published (${published})"
+              elif [ -n "$failing" ]; then
+                echo "its build is known to fail (issue #${failing}); not retried until that issue is closed"
+              else
+                echo "::notice title=Build retried::the merge of upstream ${release} (${head_sha}) has no release yet; building it again"
+                echo "- No release for the merge of upstream ${release} yet: building ${head_sha} again" >> "$GITHUB_STEP_SUMMARY"
+                build=true
+              fi
+            fi
+            {
+              echo "build=${build}"
+              echo "sha=${head_sha}"
+            } >> "$GITHUB_OUTPUT"
+            close_issue "$CONFLICT_ISSUE" "Upstream ${release} is now part of \`${TARGET_BRANCH}\`."
+            exit 0
+          fi
+
+          git config user.name "$GITHUB_REPOSITORY_OWNER"
+          git config user.email "${GITHUB_REPOSITORY_OWNER_ID}+${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com"
+          before="$(git rev-parse HEAD)"
+          git merge --no-ff --no-commit "$release_sha" || true
+          git rev-parse --quiet --verify MERGE_HEAD >/dev/null || { echo "::error::git could not start the merge of upstream ${release}"; exit 1; }
+          # this fork's workflows always win: upstream edits, additions and removals there are dropped
+          git restore --source=HEAD --staged --worktree -- .github/workflows
+          git -c core.quotePath=true diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+
+          if [ -s "$RUNNER_TEMP/conflicts.txt" ]; then
+            git merge --abort
+            [ "$(git rev-parse HEAD)" = "$before" ] && [ -z "$(git status --porcelain)" ] || { echo "::error::merge abort left the checkout dirty"; exit 1; }
+            title="${CONFLICT_ISSUE} with upstream ${release}"
+            {
+              echo "Upstream release \`${release}\` (\`${release_sha}\`) could not be merged into \`${TARGET_BRANCH}\` automatically: it conflicts with this fork's changes. The branch was left as it is and no build was started."
+              echo
+              echo "Conflicting files:"
+              echo
+              echo '~~~'
+              sed 's/^/    /' "$RUNNER_TEMP/conflicts.txt"
+              echo '~~~'
+              echo
+              echo "To resolve it locally:"
+              echo
+              echo '~~~sh'
+              echo "git fetch https://github.com/${UPSTREAM_REPO}.git 'refs/tags/${release}:refs/tags/${release}'"
+              echo "git switch ${TARGET_BRANCH} && git pull --ff-only"
+              echo "git merge --no-ff --no-commit ${release}"
+              echo "git restore --source=HEAD --staged --worktree -- .github/workflows"
+              echo "# fix the files listed above, git add them, then:"
+              echo "git commit && git push"
+              echo '~~~'
+              echo
+              echo "This issue closes by itself once \`${TARGET_BRANCH}\` contains the release. Run: ${RUN_URL}"
+            } > "$RUNNER_TEMP/issue.md"
+            found="$(find_issue "$CONFLICT_ISSUE")"
+            if [ -z "$found" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+            elif [ "${found#*$'\t'}" != "$title" ]; then
+              gh issue edit "${found%%$'\t'*}" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+              gh issue comment "${found%%$'\t'*}" --repo "$GITHUB_REPOSITORY" --body "Upstream has moved on: now blocked on release \`${release}\`. The description above is updated."
+            else
+              echo "issue #${found%%$'\t'*} already tracks this conflict"
+            fi
+            echo "::warning title=Upstream sync blocked::upstream ${release} conflicts with ${TARGET_BRANCH}; see the issue"
+            echo "- Upstream ${release} conflicts with ${TARGET_BRANCH}; nothing was pushed" >> "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --cached --quiet HEAD -- .github/workflows || { echo "::error::merge would change .github/workflows"; exit 1; }
+          if ! git diff --quiet "$(git merge-base HEAD "$release_sha")" "$release_sha" -- .github/workflows/ios.yml; then
+            echo "::warning title=Upstream iOS workflow changed::upstream ${release} changed .github/workflows/ios.yml; build-ios-unsigned-ipa.yml may need the same change"
+            echo "- Upstream ${release} changed its ios.yml; build-ios-unsigned-ipa.yml may need the same change" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git commit --quiet -m "chore(sync): merge upstream ${release}" \
+            -m "Upstream: ${UPSTREAM_REPO}@${release_sha}" \
+            -m "This fork's .github/workflows is kept as it is."
+          sha="$(git rev-parse HEAD)"
+          gh auth setup-git
+          # no force: if the branch moved meanwhile this fails and the next run starts over
+          git push origin "${sha}:refs/heads/${TARGET_BRANCH}"
+          echo "merged upstream ${release} into ${TARGET_BRANCH}: ${sha}"
+          echo "- Merged upstream ${release} into ${TARGET_BRANCH} (\`${sha}\`)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "build=true"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+          close_issue "$CONFLICT_ISSUE" "Upstream ${release} merged into \`${TARGET_BRANCH}\` as ${sha}."
+
+  build:
+    name: Build and publish
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    # the called workflow builds with a read-only token; only its publish job writes (the release)
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-ios-unsigned-ipa.yml
+    with:
+      ref: ${{ needs.sync.outputs.sha }}
+      publish_release: true
+
+  report:
+    name: Report build result
+    needs: [sync, build]
+    if: always() && needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or close the build issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE: ${{ needs.sync.outputs.release }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          found="$(gh api -X GET "repos/${GITHUB_REPOSITORY}/issues" -f state=open -f 'creator=github-actions[bot]' -F per_page=100 \
+            | jq -r --arg prefix "$BUILD_ISSUE" '[.[] | select(.pull_request == null and (.title | startswith($prefix)))][0] | select(. != null) | .number')"
+          if [ "$BUILD_RESULT" = "success" ]; then
+            [ -z "$found" ] || gh issue close "$found" --repo "$GITHUB_REPOSITORY" --comment "The build of upstream ${RELEASE} (${SHA}) succeeded: ${RUN_URL}"
+            exit 0
+          fi
+          # cancelled (for example superseded by a newer push build) is not a failure
+          [ "$BUILD_RESULT" = "failure" ] || { echo "build result: ${BUILD_RESULT}; nothing to report"; exit 0; }
+          title="${BUILD_ISSUE} after merging upstream ${RELEASE}"
+          body="Upstream release \`${RELEASE}\` was merged into \`${TARGET_BRANCH}\` as ${SHA}, but building or publishing the unsigned IPA ended with \`${BUILD_RESULT}\`. The branch contains the merge; no new release was published. Run: ${RUN_URL}"
+          if [ -z "$found" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          else
+            gh issue edit "$found" --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            gh issue comment "$found" --repo "$GITHUB_REPOSITORY" --body "Build ended with \`${BUILD_RESULT}\` again for upstream ${RELEASE}: ${RUN_URL}"
+          fi
