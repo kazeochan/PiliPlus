@@ -124,9 +124,21 @@ jobs:
           rm -rf Payload "$ipa"
           mkdir Payload
           ditto build/ios/iphoneos/Runner.app Payload/Runner.app
-          # same as upstream ios.yml: ad-hoc sign embedded frameworks so AltSign-based sideloaders accept them
-          find Payload/Runner.app/Frameworks -type d -name "*.framework" \
-            -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          # same as upstream ios.yml: ad-hoc sign embedded frameworks so AltSign-based sideloaders accept them.
+          # A loop instead of `find -exec ... \;`, whose exit status ignores codesign failures;
+          # -depth signs nested bundles before the bundle containing them.
+          signed=0
+          while IFS= read -r -d '' fw; do
+            codesign --force --sign - --preserve-metadata=identifier,entitlements "$fw" \
+              || { echo "::error::codesign failed: ${fw#Payload/}"; exit 1; }
+            signed=$((signed + 1))
+          done < <(find Payload/Runner.app/Frameworks -depth -type d -name '*.framework' -print0)
+          [ "$signed" -gt 0 ] || { echo "::error::no frameworks found to sign"; exit 1; }
+          while IFS= read -r -d '' fw; do
+            codesign --verify --strict --verbose=1 "$fw" \
+              || { echo "::error::signature does not verify: ${fw#Payload/}"; exit 1; }
+          done < <(find Payload/Runner.app/Frameworks -depth -type d -name '*.framework' -print0)
+          echo "signed and verified $signed framework(s)"
           zip -qr9y "$ipa" Payload
           shasum -a 256 "$ipa" | tee "$ipa.sha256"
           ls -lh "$ipa"
@@ -162,7 +174,6 @@ jobs:
           } | tee -a "$report"
 
           [ "$(unzip -Z1 "$IPA" | awk -F/ '{print $1}' | sort -u)" = "Payload" ] || { echo "::error::IPA root must contain only Payload/"; fail=1; }
-          lipo -archs "$app/Runner" | grep -qw arm64 || { echo "::error::Runner is not arm64"; fail=1; }
 
           required="App Flutter Mpv Avcodec Avformat Avutil Avfilter Swscale Swresample Dav1d Placebo media_kit_libs_ios_video media_kit_video media_kit_native_event_loop"
           for fw in $required; do
@@ -177,8 +188,26 @@ jobs:
           gate() {
             if [ "$STRICT_AV1" = "true" ]; then echo "::error::$1"; fail=1; else echo "::warning::$1 (non-strict run)"; fi
           }
-          # "compatibility version" major of a dylib's own LC_ID_DYLIB (line 2 of otool -L)
-          id_major() { otool -L "$1" | awk 'NR==2{for(i=1;i<=NF;i++) if($i ~ /compatibility$/){v=$(i+2); sub(/\..*/,"",v); print v}}'; }
+          # problems that make the IPA unusable whatever the mode
+          bad() { echo "BAD: $1" | tee -a "$report"; echo "::error::$1"; fail=1; }
+          # load commands of the arm64 slice, one per line:
+          #   PLATFORM <LC_BUILD_VERSION platform, 2 = iOS device>
+          #   ID <install name> <compatibility major>
+          #   DEP <load command> <install name> <compatibility major>
+          macho_info() {
+            otool -arch arm64 -l "$1" | awk '
+              $1 == "cmd" { cmd = $2; name = ""; if (cmd == "LC_VERSION_MIN_IPHONEOS") print "PLATFORM 2" }
+              $1 == "platform" && cmd == "LC_BUILD_VERSION" { print "PLATFORM", $2 }
+              $1 == "name" && cmd ~ /^LC_(ID|LOAD|LOAD_WEAK|REEXPORT|LAZY_LOAD|LOAD_UPWARD)_DYLIB$/ { name = $2 }
+              $1 == "compatibility" && $2 == "version" && name != "" {
+                v = $3; sub(/\..*/, "", v)
+                kind = (cmd == "LC_ID_DYLIB") ? "ID" : "DEP " cmd
+                print kind, name, v
+                name = ""
+              }'
+          }
+          # compatibility major of a dylib's own LC_ID_DYLIB
+          id_major() { { macho_info "$1" || true; } | awk '$1 == "ID" { print $3 }'; }
 
           avcodec="$app/Frameworks/Avcodec.framework/Avcodec"
           mpv="$app/Frameworks/Mpv.framework/Mpv"
@@ -203,24 +232,6 @@ jobs:
               gate "Avcodec ABI ${avcodec_major:-?} != expected $EXPECTED_AVCODEC_MAJOR"
             fi
 
-            # (line 1 = file name, line 2 = Mpv's own LC_ID_DYLIB, then its dependencies)
-            # every @rpath framework Mpv links must be embedded, with the same compatibility major it was linked against
-            while read -r dep_path _ _ dep_compat _; do
-              dep="${dep_path#@rpath/}"; dep="${dep%%.framework/*}"
-              dep_bin="$app/Frameworks/$dep.framework/$dep"
-              want="${dep_compat%%.*}"
-              if [ ! -f "$dep_bin" ]; then
-                echo "BAD: Mpv -> $dep (not embedded)" | tee -a "$report"; gate "Mpv links $dep.framework, which is not embedded"; continue
-              fi
-              have="$(id_major "$dep_bin")"
-              if [ "$have" = "$want" ]; then
-                echo "ok: Mpv -> $dep major $want" | tee -a "$report"
-              else
-                echo "BAD: Mpv -> $dep linked against major $want, embedded major ${have:-?}" | tee -a "$report"
-                gate "ABI mismatch: Mpv -> $dep ($want vs ${have:-?})"
-              fi
-            done < <(awk 'NR>2 && $1 ~ /^@rpath\/.*\.framework\// {print}' "$RUNNER_TEMP/mpv.otool")
-
             echo "== AV1 markers in Avcodec" | tee -a "$report"
             for marker in av1_videotoolbox libdav1d; do
               if grep -qx "$marker" "$RUNNER_TEMP/avcodec.strings"; then
@@ -235,6 +246,63 @@ jobs:
               echo "Avcodec does NOT link VideoToolbox" | tee -a "$report"; gate "Avcodec does not link VideoToolbox"
             fi
           fi
+
+          # Dependency closure from Runner over every embedded framework: each binary needs an arm64
+          # slice for iOS devices, a valid signature (frameworks), and every @rpath framework it links
+          # must be embedded with the compatibility major it was linked against (ABI: gated).
+          echo "== Dependency closure (arm64, iOS device)" | tee -a "$report"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist" 2>/dev/null || echo Runner)"
+          queue=("$app/$exe")
+          for fw_path in "$app"/Frameworks/*.framework; do
+            [ -d "$fw_path" ] || continue
+            name="$(basename "$fw_path" .framework)"
+            [ -f "$fw_path/$name" ] || { bad "$name.framework has no binary"; continue; }
+            codesign --verify --strict "$fw_path" 2>/dev/null || bad "$name.framework: signature does not verify"
+            queue+=("$fw_path/$name")
+          done
+          seen=$'\n'
+          i=0
+          while [ "$i" -lt "${#queue[@]}" ]; do
+            bin="${queue[$i]}"
+            i=$((i + 1))
+            case "$seen" in *$'\n'"$bin"$'\n'*) continue ;; esac
+            seen="$seen$bin"$'\n'
+            label="$(basename "$bin")"
+            archs="$(lipo -archs "$bin" 2>/dev/null || true)"
+            case " $archs " in
+              *" arm64 "*) ;;
+              *) bad "$label: no arm64 slice (archs: ${archs:-not Mach-O})"; continue ;;
+            esac
+            [ "$archs" = "arm64" ] || echo "::warning::$label has extra slices: $archs"
+            macho_info "$bin" > "$RUNNER_TEMP/macho.txt" || { bad "$label: otool failed"; continue; }
+            platforms="$(awk '$1 == "PLATFORM" { print $2 }' "$RUNNER_TEMP/macho.txt" | sort -u | paste -sd, -)"
+            [ "$platforms" = "2" ] || bad "$label: arm64 slice is not built for iOS devices (platform ${platforms:-unknown}; 2 = iOS, 7 = simulator)"
+            while read -r kind cmd dep_name want; do
+              [ "$kind" = "DEP" ] || continue
+              case "$dep_name" in @rpath/*.framework/*) ;; *) continue ;; esac
+              dep="${dep_name#@rpath/}"
+              dep_bin="$app/Frameworks/$dep"
+              dep_label="${dep%%.framework/*}"
+              if [ ! -f "$dep_bin" ]; then
+                if [ "$cmd" = "LC_LOAD_WEAK_DYLIB" ]; then
+                  echo "note: $label -> $dep_label (weak, not embedded)" | tee -a "$report"
+                else
+                  bad "$label -> $dep_label: not embedded in Frameworks/"
+                fi
+                continue
+              fi
+              have="$(id_major "$dep_bin")"
+              if [ "$have" = "$want" ]; then
+                echo "ok: $label -> $dep_label major $want" >> "$report"
+              else
+                echo "BAD: $label -> $dep_label linked against major $want, embedded major ${have:-?}" | tee -a "$report"
+                gate "ABI mismatch: $label -> $dep_label ($want vs ${have:-?})"
+              fi
+              queue+=("$dep_bin")
+            done < "$RUNNER_TEMP/macho.txt"
+          done
+          checked=$(printf '%s' "$seen" | grep -c . || true)
+          echo "checked $checked binaries" | tee -a "$report"
 
           {
             echo '### Unsigned IPA'
