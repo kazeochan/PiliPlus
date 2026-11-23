@@ -410,7 +410,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   // iOS invalidates the VideoToolbox session when the app goes to background,
   // which entering PiP does as well. mpv then falls back to software decoding
   // after a few failed frames and stays there until the decoder is created
-  // again, so that is done once the transition has settled.
+  // again, so that is done once the transition has settled, and for as long
+  // as PiP is shown: software decoding there pegs the CPU.
   Timer? _hwdecTimer;
 
   /// Identifies the media the hwdec state below belongs to. Bumped whenever
@@ -428,6 +429,35 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// hardware decoding is seen working again: media that cannot be decoded in
   /// hardware is not reloaded on every transition.
   bool _hwdecArmed = false;
+
+  /// Whether hardware decoding has been seen working for the current media.
+  /// Only then are further attempts made in PiP and on return: media opened
+  /// in background gets its single attempt and nothing more.
+  bool _hwdecSeen = false;
+
+  /// While PiP is shown, how often hardware decoding is checked. The decoder
+  /// is not only lost on the transition to background: it can drop out at any
+  /// point while PiP plays, after the transition checks have run, and the
+  /// software decoder then runs for the rest of the session.
+  static const _hwdecPipInterval = Duration(seconds: 2);
+
+  /// Attempts allowed during one PiP session after the armed one did not take,
+  /// as the decoder may stay unavailable for a while after the transition.
+  static const _hwdecPipRetries = 2;
+
+  int _hwdecPipRetriesLeft = 0;
+
+  /// Attempts made during the current PiP session, spaces them out.
+  int _hwdecPipAttempts = 0;
+
+  /// Time of [_hwdecClock] before which no further attempt is made in PiP.
+  Duration _hwdecNextPipAttempt = Duration.zero;
+
+  final _hwdecClock = Stopwatch()..start();
+
+  /// Grants one attempt once back in the foreground after one in background,
+  /// where the decoder may not be available at all.
+  bool _hwdecRetryOnResume = false;
 
   /// `hwdec-current` of the current media, `null` while unknown: before the
   /// media is opened, while mpv still plays or tears down the previous media,
@@ -456,6 +486,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _hwdecTimer = null;
     _hwdecOpened = false;
     _hwdecArmed = false;
+    _hwdecSeen = false;
+    _hwdecRetryOnResume = false;
+    _resetHwdecPip();
+  }
+
+  void _resetHwdecPip() {
+    _hwdecPipRetriesLeft = 0;
+    _hwdecPipAttempts = 0;
+    _hwdecNextPipAttempt = Duration.zero;
   }
 
   /// Opens media through [open] with a fresh hwdec state.
@@ -464,7 +503,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final generation = _hwdecGeneration;
     _hwdecArmed = Platform.isIOS && !IOSPipHelper.isResumed;
     await open();
-    if (generation == _hwdecGeneration) _hwdecOpened = true;
+    if (generation != _hwdecGeneration) return;
+    _hwdecOpened = true;
+    // Opening cancelled the checks of the previous media, PiP is still shown.
+    if (Platform.isIOS && IOSPipHelper.isActive) scheduleHwdecCheck();
   }
 
   bool get _hwdecEnabled => Platform.isIOS && hwdec != null && hwdec != 'no';
@@ -475,12 +517,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final current = _hwdecCurrent;
     if (current != null && current != 'no') {
       _hwdecArmed = true;
+      _hwdecSeen = true;
     }
   }
 
   /// Checks shortly after entering or leaving PiP or the background whether
-  /// hardware decoding was lost, and restores it. Calls in quick succession
-  /// are merged into one check.
+  /// hardware decoding was lost, and restores it, then keeps checking while
+  /// PiP is shown. Calls in quick succession are merged into one check.
   void scheduleHwdecCheck() {
     if (!_hwdecEnabled) return;
     noteHwdec();
@@ -498,14 +541,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     final player = _videoPlayerController;
     final configured = hwdec;
     if (player == null || configured == null || configured == 'no') return;
+    final inPip = IOSPipHelper.isActive;
+    if (inPip) {
+      // Keeps checking until PiP stops, which schedules a check of its own.
+      _hwdecTimer = Timer(_hwdecPipInterval, () => _checkHwdec(generation));
+    } else {
+      _resetHwdecPip();
+    }
     final current = _hwdecCurrent;
     if (current == null) return;
     if (current != 'no') {
       _hwdecArmed = true;
+      _hwdecSeen = true;
+      _hwdecRetryOnResume = false;
       return;
     }
-    if (!_hwdecArmed) return;
-    _hwdecArmed = false;
+    if (inPip && _hwdecClock.elapsed < _hwdecNextPipAttempt) return;
+    final resumed = IOSPipHelper.isResumed;
+    if (_hwdecArmed) {
+      _hwdecArmed = false;
+      if (inPip && _hwdecSeen) _hwdecPipRetriesLeft = _hwdecPipRetries;
+    } else if (inPip && _hwdecPipRetriesLeft > 0) {
+      _hwdecPipRetriesLeft--;
+    } else if (resumed && _hwdecRetryOnResume) {
+      _hwdecRetryOnResume = false;
+    } else {
+      return;
+    }
+    if (!resumed && _hwdecSeen) _hwdecRetryOnResume = true;
+    if (inPip) {
+      // 4 s, 8 s, 16 s, then 32 s: a decoder that keeps dropping out is not
+      // reloaded every few seconds.
+      _hwdecPipAttempts++;
+      _hwdecNextPipAttempt =
+          _hwdecClock.elapsed +
+          _hwdecPipInterval * (1 << min(_hwdecPipAttempts, 4));
+    }
     try {
       // As set by media_kit, which may differ from the setting.
       final value = player.getProperty('hwdec');
@@ -515,7 +586,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       player
         ..setProperty('hwdec', 'no')
         ..setProperty('hwdec', target);
-      if (kDebugMode) debugPrint('hwdec: restored $target');
+      // Rare, and the only trace of software decoding in PiP in a release
+      // build.
+      debugPrint(
+        'hwdec: restoring $target${inPip ? ' in PiP' : ''}'
+        '${resumed ? '' : ' in background'}',
+      );
     } catch (e) {
       if (kDebugMode) debugPrint('hwdec: restore failed: $e');
     }
