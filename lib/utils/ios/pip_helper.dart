@@ -1,7 +1,8 @@
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart' show AppLifecycleState, WidgetsBinding;
+import 'package:flutter/widgets.dart'
+    show AppLifecycleListener, AppLifecycleState, WidgetsBinding;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 
 /// Picture-in-Picture on iOS, implemented in `ios/Runner/PipPlugin.swift`.
@@ -18,7 +19,17 @@ abstract final class IOSPipHelper {
   /// Whether the native side needs playback state updates.
   static bool get needsUpdate => isActive || _autoEnter;
 
+  static bool get isResumed =>
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+
+  // Lives as long as the app.
+  // ignore: unused_field
+  static AppLifecycleListener? _lifecycleListener;
+
   static Future<void> init() async {
+    _lifecycleListener ??= AppLifecycleListener(
+      onStateChange: _onLifecycleChanged,
+    );
     _channel.setMethodCallHandler(_onMethodCall);
     try {
       isAvailable = await _channel.invokeMethod<bool>('isAvailable') ?? false;
@@ -27,13 +38,28 @@ abstract final class IOSPipHelper {
     }
   }
 
+  /// The hardware decoder does not survive the app going to background,
+  /// with or without PiP, see [PlPlayerController.scheduleHwdecCheck].
+  static void _onLifecycleChanged(AppLifecycleState state) {
+    final ctr = PlPlayerController.instance;
+    if (ctr == null) return;
+    switch (state) {
+      case AppLifecycleState.resumed:
+      case AppLifecycleState.paused:
+        ctr.scheduleHwdecCheck();
+      default:
+        // Still decoding as in the foreground.
+        ctr.noteHwdec();
+    }
+  }
+
   static Future<void> _onMethodCall(MethodCall call) async {
     switch (call.method) {
       case 'onStateChanged':
         final args = call.arguments as Map;
         isActive = args['active'] as bool;
-        final isResumed =
-            WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+        PlPlayerController.instance?.scheduleHwdecCheck();
+        final isResumed = IOSPipHelper.isResumed;
         if (args['error'] != null && isResumed) {
           SmartDialog.showToast('画中画启动失败');
         }

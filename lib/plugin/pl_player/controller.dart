@@ -407,6 +407,84 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
+  // iOS invalidates the VideoToolbox session when the app goes to background,
+  // which entering PiP does as well. mpv then falls back to software decoding
+  // after a few failed frames and stays there until the decoder is created
+  // again, so that is done once the transition has settled.
+  Timer? _hwdecTimer;
+
+  /// Whether hardware decoding has been in use for the current media. Media
+  /// that cannot be decoded in hardware is left alone.
+  bool _hwdecSeen = false;
+
+  /// Whether the current media was opened in background, where it may never
+  /// have got a hardware decoder. Allows a single attempt.
+  bool _hwdecRetryOnce = false;
+
+  String? get _hwdecCurrent {
+    try {
+      // Empty without a video track.
+      return _videoPlayerController?.getProperty('hwdec-current');
+    } catch (_) {
+      // Disposed.
+      return null;
+    }
+  }
+
+  void _resetHwdecState() {
+    _hwdecTimer?.cancel();
+    _hwdecTimer = null;
+    _hwdecSeen = false;
+    _hwdecRetryOnce = Platform.isIOS && !IOSPipHelper.isResumed;
+  }
+
+  /// Remembers whether hardware decoding is in use.
+  void noteHwdec() {
+    if (!Platform.isIOS || hwdec == null || hwdec == 'no') return;
+    final current = _hwdecCurrent;
+    if (current != null && current.isNotEmpty && current != 'no') {
+      _hwdecSeen = true;
+    }
+  }
+
+  /// Checks shortly after entering or leaving PiP or the background whether
+  /// hardware decoding was lost, and restores it. A transition makes at most
+  /// one attempt: calls in quick succession are merged.
+  void scheduleHwdecCheck() {
+    if (!Platform.isIOS || hwdec == null || hwdec == 'no') return;
+    noteHwdec();
+    _hwdecTimer?.cancel();
+    _hwdecTimer = Timer(const Duration(seconds: 1), _checkHwdec);
+  }
+
+  void _checkHwdec() {
+    _hwdecTimer = null;
+    final player = _videoPlayerController;
+    final configured = hwdec;
+    if (player == null || configured == null || configured == 'no') return;
+    final current = _hwdecCurrent;
+    if (current == null || current.isEmpty) return;
+    if (current != 'no') {
+      _hwdecSeen = true;
+      return;
+    }
+    if (!_hwdecSeen && !_hwdecRetryOnce) return;
+    _hwdecRetryOnce = false;
+    try {
+      // As set by media_kit, which may differ from the setting.
+      final value = player.getProperty('hwdec');
+      final target = value.isEmpty || value == 'no' ? configured : value;
+      // Setting the same value again is ignored by mpv, changing it creates
+      // the decoder again and resumes from the current position.
+      player
+        ..setProperty('hwdec', 'no')
+        ..setProperty('hwdec', target);
+      if (kDebugMode) debugPrint('hwdec: restored $target');
+    } catch (e) {
+      if (kDebugMode) debugPrint('hwdec: restore failed: $e');
+    }
+  }
+
   // 弹幕相关配置
   late final enableTapDm = PlatformUtils.isMobile && Pref.enableTapDm;
   late RuleFilter filters = Pref.danmakuFilterRule;
@@ -947,6 +1025,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     assert(!isLive || seekTo == null);
+    _resetHwdecState();
     await player.open(
       Media(
         video,
@@ -1687,6 +1766,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     _removeListeners();
+    _hwdecTimer?.cancel();
+    _hwdecTimer = null;
     _positionListeners.clear();
     _statusListeners.clear();
     _stopWakeLockTimer();
