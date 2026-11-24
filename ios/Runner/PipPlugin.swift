@@ -123,6 +123,9 @@ private final class PipSession: NSObject {
   /// Frame interval used while armed for auto-enter but not yet in PiP: the
   /// layer is not visible then, it only needs a recent frame to start from.
   private static let idleFrameInterval = 2.0
+  /// Delay before retrying a resize refresh whose frame was not enqueued, so
+  /// that a flush or released buffers can take effect first.
+  private static let resizeRetryDelay = 0.1
 
   let textureId: Int64
   var onStop: (() -> Void)?
@@ -150,7 +153,16 @@ private final class PipSession: NSObject {
   private var restoring = false
   /// Whether to leave the app once PiP has started, see `start()`.
   private var backgroundOnStart = false
-  private var frameInFlight = false
+  /// Tracks the frame being copied, the refreshes still owed and the PiP run
+  /// they belong to.
+  private var refreshGate = PipRefreshGate()
+  /// The PiP run and invalidation, readable off the main thread.
+  private let runState = PipRunState()
+  /// The one armed retry of a resize refresh, see `scheduleResizeRetry()`.
+  private var resizeRetry: DispatchWorkItem?
+  /// Last display scale seen while the source view was attached, used when
+  /// it is not (anymore) once the PiP window is resized.
+  private var cachedDisplayScale: CGFloat = 0
   private var lastFrameTime: CFTimeInterval = 0
   /// Whether a frame has been enqueued, PiP shows a black window otherwise.
   private var hasFrame = false
@@ -224,6 +236,7 @@ private final class PipSession: NSObject {
       // Below the Flutter view: it must be in the window, but not visible.
       window.insertSubview(sourceView, at: 0)
     }
+    _ = resolveDisplayScale()
     let aspectRatio = width > 0 && height > 0 ? width / height : 16 / 9
     let bounds = window.bounds
     var size = CGSize(width: bounds.width, height: bounds.width / aspectRatio)
@@ -293,6 +306,8 @@ private final class PipSession: NSObject {
   func invalidate() {
     invalidated = true
     pendingStart = false
+    // Drops queued resize completions, retries and pending refreshes.
+    advanceRun()
     possibleObservation?.invalidate()
     observers.forEach(NotificationCenter.default.removeObserver)
     controller.delegate = nil
@@ -314,7 +329,9 @@ private final class PipSession: NSObject {
 
   /// Must be called on the main thread.
   func frameAvailable(force: Bool = false) {
-    guard !invalidated, !frameInFlight else { return }
+    // A forced refresh (resize, start) asked for while a frame is in flight is
+    // done once that frame is finished, as a paused video sends no new frames.
+    guard !invalidated, refreshGate.shouldStart(force: force) else { return }
     if !isActive {
       // Nothing shows the layer while in background without PiP, so what is
       // enqueued then would only pile up.
@@ -330,18 +347,100 @@ private final class PipSession: NSObject {
       let source = texture.copyPixelBuffer()?.takeRetainedValue()
     else { return }
     lastFrameTime = CACurrentMediaTime()
-    frameInFlight = true
+    refreshGate.started()
+    // This frame is an attempt for the resize, an armed retry would be another.
+    if refreshGate.inFlightCarriesResize {
+      cancelResizeRetry()
+    }
     // mpv renders into the source buffer again about a frame after it stops
     // being the current one, so `submit` copies it (and downscales it if
     // needed) before returning, the layer only ever gets the copy.
     pipeline.submit(source, isPipActive: isActive) { [weak self] enqueued in
       guard let self else { return }
-      self.frameInFlight = false
-      guard !self.invalidated, enqueued, !self.hasFrame else { return }
-      self.hasFrame = true
-      self.updateAutoEnter()
-      self.startIfPending()
+      let next = self.refreshGate.finished(enqueued: enqueued)
+      // Enqueued at the new size, or given up: an armed retry is not needed.
+      if !self.refreshGate.hasPendingResize {
+        self.cancelResizeRetry()
+      }
+      if !self.invalidated, enqueued, !self.hasFrame {
+        self.hasFrame = true
+        self.updateAutoEnter()
+        self.startIfPending()
+      }
+      switch next {
+      case .none:
+        break
+      case .refresh:
+        self.frameAvailable(force: true)
+      case .retryResize:
+        self.scheduleResizeRetry()
+      case .resizeAbandoned:
+        FramePipeline.log.notice(
+          "PiP resize refresh abandoned after \(PipRefreshGate.maxResizeAttempts) attempts"
+        )
+      }
     }
+  }
+
+  /// Asks for a frame at the PiP window size set by `pipeline.setRenderSize`
+  /// in the PiP run `generation`. A paused video sends no new frames, so the
+  /// refresh is retried a few times if its frame is not enqueued.
+  private func requestResizeRefresh(generation: UInt64) {
+    guard !invalidated, isActive, refreshGate.requestResize(generation: generation) else {
+      FramePipeline.log.notice("Stale PiP resize refresh discarded")
+      return
+    }
+    // Replaces the retry of the previous resize.
+    cancelResizeRetry()
+    frameAvailable(force: true)
+  }
+
+  /// Arms the retry of the current resize, replacing any armed one. The retry
+  /// is cancelled once the resize is enqueued, given up or replaced, or the
+  /// PiP run ends, and checks the resize and run again if already dequeued.
+  private func scheduleResizeRetry() {
+    cancelResizeRetry()
+    let generation = refreshGate.generation
+    let sequence = refreshGate.resizeSequence
+    let retry = DispatchWorkItem { [weak self] in
+      guard let self, !self.invalidated, self.isActive,
+        self.refreshGate.isResizeRetryCurrent(sequence: sequence, generation: generation)
+      else { return }
+      self.frameAvailable(force: true)
+    }
+    resizeRetry = retry
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.resizeRetryDelay, execute: retry)
+  }
+
+  private func cancelResizeRetry() {
+    resizeRetry?.cancel()
+    resizeRetry = nil
+  }
+
+  /// Ends the current PiP run: what is owed to it is dropped, and callbacks
+  /// made during it are ignored, see `runState`.
+  private func advanceRun() {
+    refreshGate.advanceGeneration()
+    cancelResizeRetry()
+    runState.publish(generation: refreshGate.generation, invalidated: invalidated)
+  }
+
+  /// Scale of the screen showing the app. The source view may be detached or
+  /// the app in background while PiP is resized, so the last scale seen while
+  /// attached is used before falling back to the main screen.
+  private func resolveDisplayScale() -> CGFloat {
+    let window = sourceView.window
+    let windowScale = window?.windowScene?.screen.scale ?? window?.screen.scale
+    let traitScale = sourceView.traitCollection.displayScale
+    if let live = PipFrameSizing.validScale(windowScale) ?? PipFrameSizing.validScale(traitScale) {
+      cachedDisplayScale = live
+    }
+    return PipFrameSizing.displayScale(
+      windowScale: windowScale,
+      traitScale: traitScale,
+      cachedScale: cachedDisplayScale,
+      mainScale: UIScreen.main.scale
+    )
   }
 
   /// Same as the home gesture. There is no public API for this, `suspend` is
@@ -404,6 +503,9 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     isActive = false
+    // Refreshes owed to this PiP run must not enqueue after it, the session
+    // survives while armed for auto-enter and forced refreshes skip its throttle.
+    advanceRun()
     // Neither restored nor stopped by the app: closed from the PiP window.
     let closed = !restoring && !stopRequested
     stopRequested = false
@@ -446,9 +548,50 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     _ pictureInPictureController: AVPictureInPictureController,
     didTransitionToRenderSize newRenderSize: CMVideoDimensions
   ) {
-    // AVKit reports pixel dimensions. The source view's layout is in points.
-    pipeline.setRenderSize(newRenderSize) { [weak self] in
-      self?.frameAvailable(force: true)
+    // The run is read before any hop to the main thread, so that a callback
+    // made during a run that has stopped since is not applied to the next.
+    let run = runState.snapshot()
+    guard !run.invalidated else { return }
+    // Reads UIKit state and the session's, both main thread only.
+    if Thread.isMainThread {
+      applyRenderSize(newRenderSize, generation: run.generation)
+    } else {
+      DispatchQueue.main.async { [weak self] in
+        self?.applyRenderSize(newRenderSize, generation: run.generation)
+      }
+    }
+  }
+
+  /// Main thread only. `generation` is the PiP run the size was reported in.
+  private func applyRenderSize(_ newRenderSize: CMVideoDimensions, generation: UInt64) {
+    let run = runState.snapshot()
+    guard !invalidated, !run.invalidated, run.generation == generation else {
+      FramePipeline.log.notice(
+        "Stale AVKit render size discarded: \(newRenderSize.width)x\(newRenderSize.height)"
+      )
+      return
+    }
+    // Documented as pixels, but AVKit reports points at runtime, as the
+    // source view's layout. Logged raw so a device log shows which it is.
+    let scale = resolveDisplayScale()
+    guard
+      let pixels = PipFrameSizing.renderPixels(
+        width: Double(newRenderSize.width),
+        height: Double(newRenderSize.height),
+        scale: scale
+      )
+    else {
+      FramePipeline.log.notice(
+        "AVKit render size ignored: \(newRenderSize.width)x\(newRenderSize.height)"
+      )
+      return
+    }
+    FramePipeline.log.notice(
+      "AVKit render size: raw \(newRenderSize.width)x\(newRenderSize.height), displayScale \(Double(scale), format: .fixed(precision: 2)), target \(Double(pixels.width), format: .fixed(precision: 1))x\(Double(pixels.height), format: .fixed(precision: 1)) px"
+    )
+    // Kept even if PiP is not active yet, the refresh then waits for its start.
+    pipeline.setRenderSize(pixels) { [weak self] in
+      self?.requestResizeRefresh(generation: generation)
     }
   }
 
@@ -470,6 +613,194 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) -> Bool {
     false
+  }
+}
+
+// MARK: - Sizing
+
+/// Size of the frames sent to PiP. Pure functions, no UIKit.
+private enum PipFrameSizing {
+  /// Upper bound of the longest side of the frames sent to PiP: a 3x screen's
+  /// largest PiP window at 1:1, 6 BGRA buffers stay under 24 MiB.
+  static let maxDimension = 1280.0
+  /// Upper bound of the pixels of a frame (1280x720), bounds portrait videos.
+  static let maxPixelCount = 921_600.0
+  /// Upper bound of the longest side while the PiP window size is unknown.
+  static let idleMaxDimension = 960.0
+
+  static func validScale(_ scale: CGFloat?) -> CGFloat? {
+    guard let scale, scale.isFinite, scale > 0 else { return nil }
+    return scale
+  }
+
+  /// First valid scale of the window's screen, the view's traits, the cached
+  /// one and the main screen, at least 1.
+  static func displayScale(
+    windowScale: CGFloat?,
+    traitScale: CGFloat?,
+    cachedScale: CGFloat?,
+    mainScale: CGFloat
+  ) -> CGFloat {
+    let scale =
+      validScale(windowScale) ?? validScale(traitScale) ?? validScale(cachedScale)
+      ?? validScale(mainScale) ?? 1
+    return max(1, scale)
+  }
+
+  /// PiP window size in pixels from a render size in points, `nil` if empty.
+  static func renderPixels(width: Double, height: Double, scale: CGFloat) -> CGSize? {
+    guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }
+    let scale = Double(validScale(scale) ?? 1)
+    return CGSize(width: width * max(1, scale), height: height * max(1, scale))
+  }
+
+  /// Size of the copy of a `sourceWidth` x `sourceHeight` frame: fits in the
+  /// render size (aspect fit, as the layer), never upscaled, capped, with even
+  /// sides rounded down. `nil` if the source is empty.
+  static func frameSize(sourceWidth: Double, sourceHeight: Double, renderSize: CGSize?)
+    -> CGSize?
+  {
+    guard sourceWidth.isFinite, sourceHeight.isFinite, sourceWidth > 0, sourceHeight > 0
+    else { return nil }
+    let longest = max(sourceWidth, sourceHeight)
+    let pixelCap = (maxPixelCount / (sourceWidth * sourceHeight)).squareRoot()
+    var scale = min(1, pixelCap)
+    if let renderSize, renderSize.width > 0, renderSize.height > 0 {
+      scale = min(
+        scale,
+        maxDimension / longest,
+        renderSize.width / sourceWidth,
+        renderSize.height / sourceHeight
+      )
+    } else {
+      scale = min(scale, idleMaxDimension / longest)
+    }
+    return CGSize(
+      width: alignDown(sourceWidth * scale, source: sourceWidth),
+      height: alignDown(sourceHeight * scale, source: sourceHeight)
+    )
+  }
+
+  /// Even value at most `value`, at least 2 and at most `source`.
+  static func alignDown(_ value: Double, source: Double) -> Double {
+    let source = source.rounded(.down)
+    if source < 2 { return max(1, source) }
+    // The tolerance keeps exact products (1169.9999...) from losing 2 pixels.
+    let even = ((value + 1e-6) / 2).rounded(.down) * 2
+    return min(max(2, even), source)
+  }
+}
+
+/// Lets one frame be copied at a time and tracks the refreshes still owed:
+/// a forced refresh asked for meanwhile, done once the frame is finished, and
+/// a resize refresh, retried a few times until its frame is enqueued.
+///
+/// Both belong to a PiP run, `generation`: advancing it drops them, and a
+/// resize asked for in an earlier run is refused.
+private struct PipRefreshGate {
+  enum Next: Equatable {
+    case none
+    /// A forced refresh was asked for while the frame was in flight.
+    case refresh
+    /// The frame owed to a resize was not enqueued, try again.
+    case retryResize
+    /// The frame owed to a resize was not enqueued, and that was the last try.
+    case resizeAbandoned
+  }
+
+  /// Frames tried per resize before giving up.
+  static let maxResizeAttempts = 3
+
+  private(set) var generation: UInt64 = 0
+  private(set) var frameInFlight = false
+  /// Generation of a forced refresh asked for while a frame was in flight.
+  private(set) var pendingRefreshGeneration: UInt64?
+  /// Frames left to try for the last resize, 0 once enqueued or given up.
+  private(set) var resizeAttemptsLeft = 0
+  /// Whether the frame in flight was started at the last resize's size.
+  private(set) var inFlightCarriesResize = false
+  /// Number of the last resize, a retry only serves the resize it was armed for.
+  private(set) var resizeSequence: UInt64 = 0
+
+  var pendingForcedRefresh: Bool { pendingRefreshGeneration == generation }
+  var hasPendingResize: Bool { resizeAttemptsLeft > 0 }
+
+  /// Whether a retry armed for resize `sequence` in run `generation` is due:
+  /// not if a frame in flight is already an attempt for it, as the forced
+  /// refresh it would leave pending would hide that attempt's outcome.
+  func isResizeRetryCurrent(sequence: UInt64, generation: UInt64) -> Bool {
+    generation == self.generation && sequence == resizeSequence && hasPendingResize
+      && !(frameInFlight && inFlightCarriesResize)
+  }
+
+  /// Starts a new PiP run, dropping what is owed to the previous one.
+  mutating func advanceGeneration() {
+    generation &+= 1
+    pendingRefreshGeneration = nil
+    resizeAttemptsLeft = 0
+    inFlightCarriesResize = false
+  }
+
+  /// Owes a frame at a new render size, unless asked for in an earlier run.
+  mutating func requestResize(generation: UInt64) -> Bool {
+    guard generation == self.generation else { return false }
+    resizeSequence &+= 1
+    resizeAttemptsLeft = Self.maxResizeAttempts
+    // The frame in flight may have been copied at the previous size.
+    inFlightCarriesResize = false
+    return true
+  }
+
+  /// Whether a frame may be started now.
+  mutating func shouldStart(force: Bool) -> Bool {
+    guard frameInFlight else { return true }
+    if force { pendingRefreshGeneration = generation }
+    return false
+  }
+
+  mutating func started() {
+    frameInFlight = true
+    inFlightCarriesResize = resizeAttemptsLeft > 0
+  }
+
+  /// Ends the frame, returns what to do next.
+  mutating func finished(enqueued: Bool) -> Next {
+    frameInFlight = false
+    let refresh = pendingForcedRefresh
+    pendingRefreshGeneration = nil
+    var next = Next.none
+    if inFlightCarriesResize {
+      inFlightCarriesResize = false
+      if enqueued {
+        resizeAttemptsLeft = 0
+      } else {
+        resizeAttemptsLeft = max(0, resizeAttemptsLeft - 1)
+        next = resizeAttemptsLeft > 0 ? .retryResize : .resizeAbandoned
+      }
+    }
+    // The refresh is started right away and carries the resize if still owed.
+    return refresh ? .refresh : next
+  }
+}
+
+/// The PiP run (`PipRefreshGate.generation`) and whether the session is
+/// invalidated, readable from any thread. Written on the main thread.
+private final class PipRunState {
+  private let lock = NSLock()
+  private var generation: UInt64 = 0
+  private var invalidated = false
+
+  func snapshot() -> (generation: UInt64, invalidated: Bool) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (generation, invalidated)
+  }
+
+  func publish(generation: UInt64, invalidated: Bool) {
+    lock.lock()
+    defer { lock.unlock() }
+    self.generation = generation
+    self.invalidated = invalidated
   }
 }
 
@@ -499,15 +830,11 @@ private final class FramePipeline {
     case failed
   }
 
-  /// Upper bound of the longest side of the frames sent to PiP.
-  private static let maxDimension = 1920.0
-  /// Same, while the size of the PiP window is not known yet.
-  private static let idleMaxDimension = 960.0
   /// Number of pixel buffers that may be alive at once.
   private static let maxBufferCount = 6
   /// Number of consecutive dropped frames after which the layer is flushed again.
   private static let flushAfterDrops = 30
-  private static let log = Logger(subsystem: "com.example.piliplus", category: "PiP")
+  static let log = Logger(subsystem: "com.example.piliplus", category: "PiP")
   private static let diagnosticsInterval: CFTimeInterval = 5
 
   private let queue = DispatchQueue(label: "com.example.piliplus.pip.frame")
@@ -565,13 +892,10 @@ private final class FramePipeline {
     }
   }
 
-  func setRenderSize(_ dimensions: CMVideoDimensions, completion: @escaping () -> Void) {
-    let size = CGSize(width: Int(dimensions.width), height: Int(dimensions.height))
+  /// `size` is the PiP window size in pixels, see `PipFrameSizing`.
+  func setRenderSize(_ size: CGSize, completion: @escaping () -> Void) {
     queue.async {
-      if self.renderSizePixels != size {
-        self.renderSizePixels = size
-        Self.log.notice("AVKit render size: \(dimensions.width)x\(dimensions.height) px")
-      }
+      self.renderSizePixels = size
       DispatchQueue.main.async(execute: completion)
     }
   }
@@ -731,27 +1055,24 @@ private final class FramePipeline {
   private func copy(_ source: CVPixelBuffer) -> Snapshot {
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
     let sourceHeight = Double(CVPixelBufferGetHeight(source))
-    guard sourceWidth > 0, sourceHeight > 0 else { return .failed }
     let hasRenderSize = renderSizePixels.width > 0 && renderSizePixels.height > 0
-    let maxDimension = hasRenderSize ? Self.maxDimension : Self.idleMaxDimension
-    var scale = min(1, maxDimension / max(sourceWidth, sourceHeight))
-    if hasRenderSize {
-      // No need for more pixels than the PiP window has.
-      scale = min(
-        scale,
-        max(renderSizePixels.width / sourceWidth, renderSizePixels.height / sourceHeight)
+    // No need for more pixels than the PiP window has.
+    guard
+      let size = PipFrameSizing.frameSize(
+        sourceWidth: sourceWidth,
+        sourceHeight: sourceHeight,
+        renderSize: hasRenderSize ? renderSizePixels : nil
       )
-    }
-    let size = CGSize(
-      width: max(1, (sourceWidth * scale).rounded()),
-      height: max(1, (sourceHeight * scale).rounded())
-    )
+    else { return .failed }
 
     if pool == nil || poolSize != size {
       // Frames of the previous size keep the buffers of the previous pool alive.
       flushBeforeEnqueue = true
       pool = nil
       poolSize = size
+      Self.log.notice(
+        "Pool size changed: \(Int(size.width))x\(Int(size.height)) px for a \(Int(sourceWidth))x\(Int(sourceHeight)) source, render size \(Double(self.renderSizePixels.width), format: .fixed(precision: 1))x\(Double(self.renderSizePixels.height), format: .fixed(precision: 1)) px"
+      )
       let attributes: [CFString: Any] = [
         kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
         kCVPixelBufferWidthKey: Int(size.width),
@@ -776,7 +1097,7 @@ private final class FramePipeline {
     guard status == kCVReturnSuccess, let output else { return .failed }
 
     var image = CIImage(cvPixelBuffer: source)
-    if scale < 1 {
+    if size.width != sourceWidth || size.height != sourceHeight {
       image = image.transformed(
         by: CGAffineTransform(
           scaleX: size.width / sourceWidth,
